@@ -1,30 +1,8 @@
-UART example with ring buffers
+current - relay on off 
 
-Example description
-The UART example shows how to use the UART in interrupt mode with transmit
-and receive ring buffers.
+0x27,0x05,0x85,0x01,0x06,Relay_Number, On/Off, 0x16
 
-To use the example, connect a serial cable to the board's RS232/UART port and
-start a terminal program to monitor the port.  The terminal program on the host
-PC should be setup for 115200-8-N-1.
-Once the example is started, a small message is printed on terminal. Any data
-received will be returned back to the caller.
+Possible values of Relay Number = 0x01, 0x02, 0x03, 0x04, 0x05,0x06
+Possible values of On/Off = 0x01, 0x00
 
-Special connection requirements
-- Embedded Artists' LPC1788 Developer's Kit:
-- Embedded Artists' LPC4088 Developer's Kit:
-Default is UART0. This uses the UART-to-USB bridge.
-If using UART2: Connects UART pins to COM Port (J17)
-JP6-1-2: OFF:
-JP6-3-4: OFF:
-JP6-5-6: ON:
-JP12: 2-3
-JP13: 2-3
-Other jumpers: Default
-- LPCXpresso LPC1769:
-Need to connect with base board for using RS232/UART port.
-
-Build procedures:
-Visit the LPCOpen quickstart guides at link "http://www.lpcware.com/content/project/lpcopen-platform-nxp-lpc-microcontrollers/lpcopen-v200-quickstart-guides"
-to get started building LPCOpen projects.
-
+Relay 1 = P4[28] Relay 2 = P0[4] Relay 3 = P0[5] Relay 4 = P0[6] Relay 5 = P0[7] Relay 6 = P0[8]
