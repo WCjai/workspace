@@ -16,6 +16,7 @@
 #define UART_SLAVE      ((LPC_USART_T *)LPC_UART1)
 #define IRQ_SLAVE       UART1_IRQn
 
+#define RIT_IRQN        RITIMER_IRQn
 /* =========================== Protocol constants ============================== */
 enum { SOF = 0x27, END_BYTE = 0x16 };
 enum { GRP_APP_TO_RX = 0x85, GRP_RX_TO_APP = 0x00 };
@@ -27,9 +28,10 @@ enum { SC_STATUS = 0x0A };
 #define SLAVE_BAUD      9600    /* set to your slave's actual baud */
 
 /* ================================ Timing ===================================== */
-#define PING_PREMAP_MS      200u            /* broadcast ping before map upload */
-#define PING_AFTERMAP_MS    200u            /* per-connector ping after map */
-#define TTL_MARGIN_MS       30u
+/* Replicate original RX device cadence exactly */
+#define PING_PREMAP_MS      200u   /* broadcast ping before map upload */
+#define PING_AFTERMAP_MS    200u   /* per-connector ping after map     */
+#define TTL_MARGIN_MS       100u
 
 /* ================================ Limits ===================================== */
 #define MAX_CFG             31
@@ -37,7 +39,7 @@ enum { SC_STATUS = 0x0A };
 #define APP_TX_FRAME_MAX    (MAX_CFG + 10)    /* status frame cap */
 
 /* ============================== Slave "lens" ================================= */
-/* If your slave uses real lengths (common: 0x09/0x08), set here. */
+/* If your slave uses true lengths (0x09/0x08), change here. You said 0x97. */
 #define SLAVE_LEN_PING  0x97
 #define SLAVE_LEN_ON    0x97
 #define SLAVE_LEN_OFF   0x97
@@ -62,14 +64,26 @@ static xSemaphoreHandle gStateMtx;
 static xQueueHandle qAppRxBytes;   /* UART0 RX bytes */
 static xQueueHandle qSlvRxBytes;   /* UART1 RX bytes */
 
-/* UART1 TX queues: LED commands (highest) and PINGs (low) */
+/* UART1 TX queues */
 typedef struct { uint8_t bytes[16]; uint8_t len; } slv_frame_t;
-static xQueueHandle qSlvLed;       /* prioritized LED frames */
-static xQueueHandle qSlvPing;      /* pings */
+/* ---- RIT IRQ name compatibility (LPCOpen uses RITIMER_IRQn) ---- */
+
+
+/* LED command (highest priority) */
+typedef struct { uint8_t con; uint8_t led; uint8_t state; bool reset_all; } slv_led_cmd_t;
+static xQueueHandle qSlvLedCmd;    /* LED commands */
+
+/* Pings (lower priority) */
+static xQueueHandle qSlvPing;      /* ping frames */
 
 /* UART0 TX queue: STATUS frames to APP */
 typedef struct { uint8_t bytes[APP_TX_FRAME_MAX]; uint8_t len; } app_frame_t;
 static xQueueHandle qAppTx;
+static xSemaphoreHandle qSlvTxKick;
+
+/* --------- forward declarations for helpers used before their definitions ---- */
+static void enqueue_status_frame_urgent_replace(void);
+static void enqueue_status_frame_coalesced(void);
 
 /* ============================ Internal helpers =============================== */
 static inline uint32_t per_connector_period_ms(void) {
@@ -110,7 +124,7 @@ static inline void build_slave_led_on(slv_frame_t *f, uint8_t con, uint8_t led){
     memcpy(f->bytes, b, 9); f->len = 9;
 }
 static inline void build_slave_led_off_all(slv_frame_t *f){
-    /* per your capture: FF 00 00, not FF 03 00 */
+    /* per your capture: FF 00 00 */
     const uint8_t b[8] = { 0x27, SLAVE_LEN_OFF, 0x04, 0x85, 0xFF, 0x03, 0x00, 0x16 };
     memcpy(f->bytes, b, 8); f->len = 8;
 }
@@ -154,13 +168,42 @@ static void enqueue_status_frame(void){
     if (n){ f.len = n; (void)xQueueSend(qAppTx, &f, 0); }
 }
 
-/* Push newest status **to front** (urgent, e.g., limit change) */
-static void enqueue_status_frame_urgent(void){
+/* ---- APP TX helpers: "latest-wins" for urgent, coalesced normal ---- */
+static inline unsigned portBASE_TYPE app_tx_has_pending(void) {
+    return (uxQueueMessagesWaiting(qAppTx) > 0);
+}
+
+/* Drop all pending, then enqueue the newest status (never blocks). */
+static void enqueue_status_frame_urgent_replace(void){
     app_frame_t f;
     xSemaphoreTake(gStateMtx, portMAX_DELAY);
     uint8_t n = build_status_locked(f.bytes, sizeof(f.bytes));
     xSemaphoreGive(gStateMtx);
-    if (n){ f.len = n; (void)xQueueSendToFront(qAppTx, &f, 0); }
+    if (!n) return;
+    f.len = n;
+
+    taskENTER_CRITICAL();          // avoid race with Task_AppTx dequeue
+    xQueueReset(qAppTx);           // drop any regular heartbeats
+    (void)xQueueSend(qAppTx, &f, 0);
+    taskEXIT_CRITICAL();
+}
+
+/* Enqueue a regular heartbeat only if none is pending (coalesce). */
+static void enqueue_status_frame_coalesced(void){
+    if (app_tx_has_pending()) return;  // drop; an older HB is still waiting
+    app_frame_t f;
+    xSemaphoreTake(gStateMtx, portMAX_DELAY);
+    uint8_t n = build_status_locked(f.bytes, sizeof(f.bytes));
+    xSemaphoreGive(gStateMtx);
+    if (!n) return;
+    f.len = n;
+    (void)xQueueSend(qAppTx, &f, 0);   // best-effort; never block
+}
+
+static void slv_tx_wake(void){
+    if (qSlvTxKick != NULL){
+        (void)xSemaphoreGive(qSlvTxKick);
+    }
 }
 
 /* ========================== App command handlers ============================= */
@@ -176,16 +219,17 @@ static void handle_upload_map(const uint8_t *pay, uint8_t pal){
         uint8_t state = pay[1 + 2*i + 1];
         if (state == 0x01) cfg_conn[cfg_count++] = con;
     }
-    /* optional: clear last seen & limit states on new map */
-    /* for (int c=1;c<=31;++c){ last_seen_ms[c]=0; limit_state[c]=0x01; } */
     recompute_alive_ttl_locked();
     xSemaphoreGive(gStateMtx);
 
-    enqueue_status_frame();  /* immediate status after map */
+    /* Switch RIT cadence now that we know N (post-map = 50 ms) */
+    Chip_RIT_SetTimerInterval(LPC_RITIMER, (cfg_count == 0) ? PING_PREMAP_MS : PING_AFTERMAP_MS);
+
+    slv_tx_wake();
 }
 
 /* LED commands = highest priority:
-   - Drop stale LED frames (reset queue) so we always execute the latest intent.
+   - Drop stale LED frames so we always execute the latest intent.
    - Enqueue OFF-ALL then ON (if state=1). */
 static void handle_led_ctrl(const uint8_t *pay, uint8_t pal){
     if (pal < 3) return;
@@ -193,27 +237,34 @@ static void handle_led_ctrl(const uint8_t *pay, uint8_t pal){
     uint8_t con   = pay[1];
     uint8_t led   = pay[2];
 
-    slv_frame_t f_off, f_on;
-    build_slave_led_off_all(&f_off);
-    build_slave_led_on(&f_on, con, led);
+    /* Drop pending LED commands so we execute the freshest intent */
+    slv_led_cmd_t discard;
+    while (xQueueReceive(qSlvLedCmd, &discard, 0) == pdTRUE){}
 
-    /* Purge any pending LED frames so we don't execute stale commands */
-    xQueueReset(qSlvLed);
+    slv_led_cmd_t cmd = {
+        .con = con,
+        .led = led,
+        .state = state ? 1u : 0u,
+        .reset_all = false
+    };
+    (void)xQueueSend(qSlvLedCmd, &cmd, 0);
 
-    /* Always clear first (per your behavior) */
-    (void)xQueueSend(qSlvLed, &f_off, 0);
-
-    /* If ON requested, enqueue it next */
-    if (state){
-        (void)xQueueSend(qSlvLed, &f_on, 0);
-    }
+    slv_tx_wake();
 }
 
 static void handle_led_reset(void){
-    slv_frame_t f; build_slave_led_off_all(&f);
-    /* Purge stale LED frames to ensure this reset wins immediately */
-    xQueueReset(qSlvLed);
-    (void)xQueueSend(qSlvLed, &f, 0);
+    /* Flush any queued LED command and post a broadcast OFF */
+    slv_led_cmd_t discard;
+    while (xQueueReceive(qSlvLedCmd, &discard, 0) == pdTRUE){}
+
+    slv_led_cmd_t cmd = {
+        .con = 0u,
+        .led = 0u,
+        .state = 0u,
+        .reset_all = true
+    };
+    (void)xQueueSend(qSlvLedCmd, &cmd, 0);
+    slv_tx_wake();
 }
 
 extern void Board_Relay_Set(uint8_t relay, bool on);
@@ -223,6 +274,47 @@ static void handle_relay_set(const uint8_t *pay, uint8_t pal){
     bool on = (pay[1] == 0x01);
     Board_Relay_Set(relay, on);
 }
+
+/* ============================= Timer (RIT) =================================== */
+/* Use RIT as the deterministic 55ms/50ms ping scheduler. */
+static volatile uint8_t rit_rr = 0; /* round-robin index after map */
+
+void RIT_IRQHandler(void){
+    portBASE_TYPE hpw = pdFALSE;
+
+    /* Ack the interrupt */
+    Chip_RIT_ClearInt(LPC_RITIMER);
+
+    slv_frame_t f;
+
+    /* Snapshot count without lock (8-bit, atomic read). */
+    uint8_t n = cfg_count;
+
+    if (n == 0){
+        /* Pre-map: broadcast ping every 55 ms */
+        build_slave_ping_broadcast(&f);
+        (void)xQueueSendFromISR(qSlvPing, &f, &hpw);
+    } else {
+        /* Post-map: per-connector round-robin every 50 ms */
+        if (rit_rr >= n) rit_rr = 0;
+        uint8_t con = cfg_conn[rit_rr++];
+        build_slave_ping_addr(&f, con);
+        (void)xQueueSendFromISR(qSlvPing, &f, &hpw);
+    }
+
+    /* Wake the UART1 TX worker */
+    if (qSlvTxKick) xSemaphoreGiveFromISR(qSlvTxKick, &hpw);
+
+    portYIELD_FROM_ISR(hpw);
+}
+
+static void init_rit(uint32_t period_ms){
+    Chip_RIT_Init(LPC_RITIMER);
+    Chip_RIT_SetTimerInterval(LPC_RITIMER, period_ms);
+    NVIC_SetPriority(RITIMER_IRQn, configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY + 1);
+    NVIC_EnableIRQ(RITIMER_IRQn);
+}
+
 
 /* ============================= Tasks & ISRs ================================== */
 /* UART0 ISR: push bytes to qAppRxBytes */
@@ -274,17 +366,20 @@ static void Task_AppParser(void *arg){
 
                     if (group == GRP_APP_TO_RX && id == RX_ID){
                         switch (sc){
-                            case SC_POLL:        enqueue_status_frame();         break;
-                            case SC_UPLOAD_MAP:  handle_upload_map(pay, pal);    break;
-                            case SC_LED_CTRL:    handle_led_ctrl(pay, pal);      break;
-                            case SC_LED_RESET:   handle_led_reset();             break;
-                            case SC_RELAY_SET:   handle_relay_set(pay, pal);     break;
+                            case SC_POLL:        break; /* HB below */
+                            case SC_UPLOAD_MAP:  handle_upload_map(pay, pal);  break;
+                            case SC_LED_CTRL:    handle_led_ctrl(pay, pal);    break;
+                            case SC_LED_RESET:   handle_led_reset();           break;
+                            case SC_RELAY_SET:   handle_relay_set(pay, pal);   break;
                             default: break;
                         }
+                        /* Heartbeat for ANY command (coalesced) */
+                        enqueue_status_frame_coalesced();
                     }
                 }
             }
-            st = RXF_WAIT_SOF; break;
+            st = RXF_WAIT_SOF;
+            break;
         }
     }
 }
@@ -315,46 +410,17 @@ static void Task_SlvRxParser(void *arg){
                 xSemaphoreTake(gStateMtx, portMAX_DELAY);
                 alive_mark_seen_locked(addr, now_ms);
                 prev_lim = (addr>=1 && addr<=31) ? limit_state[addr] : 0x01;
-                if (addr>=1 && addr<=31) limit_state[addr] = lim; /* 0x01/0x03 */
+                if (addr>=1 && addr<=31) limit_state[addr] = lim;  /* 0x01 or 0x03 */
                 xSemaphoreGive(gStateMtx);
 
-                /* URGENT: on limit change, push status immediately to APP */
-                if (lim != prev_lim){
-                    enqueue_status_frame_urgent();
+                if (lim != prev_lim) {
+                    /* GUARANTEE: replace any pending heartbeats with this updated one */
+                    enqueue_status_frame_urgent_replace();
                 }
             }
-            st=SLP_WAIT_SOF; break;
+            st = SLP_WAIT_SOF;
+            break;
         }
-    }
-}
-
-/* Task: SLAVE Pinger → puts frames into qSlvPing */
-static void Task_SlvPinger(void *arg){
-    (void)arg;
-    portTickType last = NOW_TICKS();
-    uint8_t rr = 0;
-
-    for (;;){
-        uint32_t interval_ms;
-        uint8_t local_cfg[MAX_CFG]; uint8_t n;
-
-        xSemaphoreTake(gStateMtx, portMAX_DELAY);
-        n = cfg_count;
-        memcpy(local_cfg, cfg_conn, n);
-        interval_ms = (n==0) ? PING_PREMAP_MS : PING_AFTERMAP_MS;
-        xSemaphoreGive(gStateMtx);
-
-        slv_frame_t f;
-        if (n==0){
-            build_slave_ping_broadcast(&f);
-            (void)xQueueSend(qSlvPing, &f, 0);
-        } else {
-            if (rr >= n) rr = 0;
-            build_slave_ping_addr(&f, local_cfg[rr++]);
-            (void)xQueueSend(qSlvPing, &f, 0);
-        }
-
-        vTaskDelayUntil(&last, MS_TO_TICKS(interval_ms));
     }
 }
 
@@ -362,18 +428,32 @@ static void Task_SlvPinger(void *arg){
 static void Task_SlvTx(void *arg){
     (void)arg;
     slv_frame_t f;
+    slv_led_cmd_t led;
     for (;;){
-        /* Serve LED frames first (non-blocking) */
-        if (xQueueReceive(qSlvLed, &f, 0) == pdTRUE){
+        bool have_led = false;
+        while (xQueueReceive(qSlvLedCmd, &led, 0) == pdTRUE){
+            have_led = true;
+        }
+        if (have_led){
+            build_slave_led_off_all(&f);                  /* OFF-all first */
+            uart_send_blocking(UART_SLAVE, f.bytes, f.len);
+            if (!led.reset_all && led.state){
+                build_slave_led_on(&f, led.con, led.led); /* then ON if requested */
+                uart_send_blocking(UART_SLAVE, f.bytes, f.len);
+            }
+            continue;
+        }
+
+        if (xQueueReceive(qSlvPing, &f, 0) == pdTRUE){
             uart_send_blocking(UART_SLAVE, f.bytes, f.len);
             continue;
         }
-        /* Then pings (small timeout so LED can preempt quickly) */
-        if (xQueueReceive(qSlvPing, &f, MS_TO_TICKS(5)) == pdTRUE){
-            uart_send_blocking(UART_SLAVE, f.bytes, f.len);
-            continue;
+
+        if (qSlvTxKick != NULL){
+            (void)xSemaphoreTake(qSlvTxKick, portMAX_DELAY);
+        } else {
+            taskYIELD();
         }
-        taskYIELD();
     }
 }
 
@@ -421,9 +501,14 @@ int main(void){
     /* Queues */
     qAppRxBytes = xQueueCreate(256, sizeof(uint8_t));
     qSlvRxBytes = xQueueCreate(256, sizeof(uint8_t));
-    qSlvLed     = xQueueCreate(8, sizeof(slv_frame_t));   /* LED: high-priority */
-    qSlvPing    = xQueueCreate(8, sizeof(slv_frame_t));   /* pings: low-priority */
-    qAppTx      = xQueueCreate(6, sizeof(app_frame_t));   /* allow bursts */
+    qSlvLedCmd  = xQueueCreate(4, sizeof(slv_led_cmd_t));  /* LED commands */
+    qSlvPing    = xQueueCreate(8, sizeof(slv_frame_t));    /* pings: low-priority */
+    qAppTx      = xQueueCreate(6, sizeof(app_frame_t));    /* allow bursts */
+    vSemaphoreCreateBinary(qSlvTxKick);   /* v7 API */
+    configASSERT(qSlvTxKick);
+    configASSERT(qSlvLedCmd);
+    /* Make it initially empty (modern behavior) */
+    xSemaphoreTake(qSlvTxKick, 0);
 
     /* Shared-state defaults */
     xSemaphoreTake(gStateMtx, portMAX_DELAY);
@@ -436,12 +521,16 @@ int main(void){
     init_uart_app();
     init_uart_slave();
 
-    /* Task priorities: LED TX highest, then APP TX, then RX parsers, then pinger */
+    /* Start RIT for pre-map cadence (55 ms). It will be switched to 50 ms after map. */
+    init_rit(PING_PREMAP_MS);
+
+    /* Task priorities:
+       - Make APP TX high so urgent limit-change frames go quickly.
+       - Keep LED TX high for UART1, then RX parsers. (No pinger task now.) */
+    xTaskCreate(Task_AppTx,       (signed char*)"appTx",   configMINIMAL_STACK_SIZE + 128, NULL, (tskIDLE_PRIORITY+6), NULL);
+    xTaskCreate(Task_SlvTx,       (signed char*)"slvTx",   configMINIMAL_STACK_SIZE + 128, NULL, (tskIDLE_PRIORITY+5), NULL);
     xTaskCreate(Task_AppParser,   (signed char*)"appRx",   configMINIMAL_STACK_SIZE + 256, NULL, (tskIDLE_PRIORITY+3), NULL);
     xTaskCreate(Task_SlvRxParser, (signed char*)"slvRx",   configMINIMAL_STACK_SIZE + 256, NULL, (tskIDLE_PRIORITY+3), NULL);
-    xTaskCreate(Task_SlvPinger,   (signed char*)"pinger",  configMINIMAL_STACK_SIZE + 128, NULL, (tskIDLE_PRIORITY+2), NULL);
-    xTaskCreate(Task_SlvTx,       (signed char*)"slvTx",   configMINIMAL_STACK_SIZE + 128, NULL, (tskIDLE_PRIORITY+5), NULL); /* highest worker */
-    xTaskCreate(Task_AppTx,       (signed char*)"appTx",   configMINIMAL_STACK_SIZE + 128, NULL, (tskIDLE_PRIORITY+4), NULL); /* next highest */
 
     vTaskStartScheduler();
     for(;;){}
