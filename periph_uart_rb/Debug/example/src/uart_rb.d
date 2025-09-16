@@ -38,7 +38,18 @@ example/src/uart_rb.o example/src/uart_rb.d: ../example/src/uart_rb.c \
  C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/error.h \
  C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_board_nxp_lpcxpresso_1769\inc/board.h \
  C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_board_nxp_lpcxpresso_1769\inc/board_api.h \
- C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/lpc_types.h
+ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/lpc_types.h \
+ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/FreeRTOS.h \
+ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/projdefs.h \
+ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\example\inc/FreeRTOSConfig.h \
+ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/portable.h \
+ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/portmacro.h \
+ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/mpu_wrappers.h \
+ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/task.h \
+ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/list.h \
+ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/queue.h \
+ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/semphr.h \
+ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/queue.h
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/chip.h:
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/lpc_types.h:
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/sys_config.h:
@@ -79,3 +90,14 @@ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/e
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_board_nxp_lpcxpresso_1769\inc/board.h:
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_board_nxp_lpcxpresso_1769\inc/board_api.h:
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/lpc_types.h:
+C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/FreeRTOS.h:
+C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/projdefs.h:
+C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\example\inc/FreeRTOSConfig.h:
+C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/portable.h:
+C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/portmacro.h:
+C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/mpu_wrappers.h:
+C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/task.h:
+C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/list.h:
+C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/queue.h:
+C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/semphr.h:
+C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\periph_uart_rb\freertos\inc/queue.h:
