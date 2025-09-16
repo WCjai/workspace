@@ -1,27 +1,19 @@
 #include "board.h"
 
-/*****************************************************************************
- * Minimal board setup for relays
- ****************************************************************************/
+#define RELAY1_GPIO_PORT_NUM  4
+#define RELAY1_GPIO_BIT_NUM   28
+#define RELAY2_GPIO_PORT_NUM  0
+#define RELAY2_GPIO_BIT_NUM   4
+#define RELAY3_GPIO_PORT_NUM  0
+#define RELAY3_GPIO_BIT_NUM   5
+#define RELAY4_GPIO_PORT_NUM  0
+#define RELAY4_GPIO_BIT_NUM   6
+#define RELAY5_GPIO_PORT_NUM  0
+#define RELAY5_GPIO_BIT_NUM   7
+#define RELAY6_GPIO_PORT_NUM  0
+#define RELAY6_GPIO_BIT_NUM   8
 
-#define RELAY1_GPIO_PORT_NUM                      4
-#define RELAY1_GPIO_BIT_NUM                       28
-#define RELAY2_GPIO_PORT_NUM                      0
-#define RELAY2_GPIO_BIT_NUM                       4
-#define RELAY3_GPIO_PORT_NUM                      0
-#define RELAY3_GPIO_BIT_NUM                       5
-#define RELAY4_GPIO_PORT_NUM                      0
-#define RELAY4_GPIO_BIT_NUM                       6
-#define RELAY5_GPIO_PORT_NUM                      0
-#define RELAY5_GPIO_BIT_NUM                       7
-#define RELAY6_GPIO_PORT_NUM                      0
-#define RELAY6_GPIO_BIT_NUM                       8
-
-
-typedef struct {
-    uint8_t port;
-    uint8_t pin;
-} relay_pin_t;
+typedef struct { uint8_t port, pin; } relay_pin_t;
 
 static const relay_pin_t kRelayPins[6] = {
    { RELAY1_GPIO_PORT_NUM, RELAY1_GPIO_BIT_NUM },
@@ -32,29 +24,25 @@ static const relay_pin_t kRelayPins[6] = {
    { RELAY6_GPIO_PORT_NUM, RELAY6_GPIO_BIT_NUM },
 };
 
-const uint32_t OscRateIn   = 12000000;
+const uint32_t OscRateIn    = 12000000;
 const uint32_t RTCOscRateIn = 32768;
 
-void Board_Relays_Init(void)
-{
+void Board_Relays_Init(void) {
     for (unsigned i = 0; i < 6; ++i) {
         const relay_pin_t *rp = &kRelayPins[i];
         Chip_GPIO_WriteDirBit(LPC_GPIO, rp->port, rp->pin, true);
-        Chip_GPIO_WritePortBit(LPC_GPIO, rp->port, rp->pin, false); /* default OFF */
+        Chip_GPIO_WritePortBit(LPC_GPIO, rp->port, rp->pin, false);
     }
 }
 
-void Board_Relay_Set(uint8_t relay, bool on)
-{
+void Board_Relay_Set(uint8_t relay, bool on) {
     if (relay >= 1 && relay <= 6) {
         const relay_pin_t *rp = &kRelayPins[relay - 1];
         Chip_GPIO_WritePortBit(LPC_GPIO, rp->port, rp->pin, on);
     }
 }
 
-void Board_Init(void)
-{
-    /* GPIO + IOCON only; no debug UART or LEDs */
+void Board_Init(void) {
     Chip_GPIO_Init(LPC_GPIO);
     Chip_IOCON_Init(LPC_IOCON);
     Board_Relays_Init();

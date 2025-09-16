@@ -1,12 +1,12 @@
 #include "board.h"
 
-/* Pin muxing: UART0 on P0.2/P0.3, UART1 on P2.0/P2.1, relay GPIOs on func 0 */
+/* UART0 on P0.2/P0.3, UART1 on P2.0/P2.1, relay GPIOs */
 STATIC const PINMUX_GRP_T pinmuxing[] = {
     {0,  2, IOCON_MODE_INACT | IOCON_FUNC1}, /* TXD0 */
     {0,  3, IOCON_MODE_INACT | IOCON_FUNC1}, /* RXD0 */
 
-    {2,  0, IOCON_MODE_INACT | IOCON_FUNC2}, /* TXD1 (verify FUNC on your board) */
-    {2,  1, IOCON_MODE_INACT | IOCON_FUNC2}, /* RXD1 (verify FUNC on your board) */
+    {2,  0, IOCON_MODE_INACT | IOCON_FUNC2}, /* TXD1 (verify FUNC for your MCU) */
+    {2,  1, IOCON_MODE_INACT | IOCON_FUNC2}, /* RXD1 */
 
     {4, 28, IOCON_MODE_INACT | IOCON_FUNC0}, /* Relay 1 */
     {0,  4, IOCON_MODE_INACT | IOCON_FUNC0}, /* Relay 2 */
@@ -23,7 +23,7 @@ void Board_SetupMuxing(void) {
 
 void Board_SetupClocking(void) {
     Chip_SetupXtalClocking();
-    Chip_SYSCTL_SetFLASHAccess(FLASHTIM_100MHZ_CPU); /* 100 MHz */
+    Chip_SYSCTL_SetFLASHAccess(FLASHTIM_100MHZ_CPU);
 }
 
 void Board_SystemInit(void) {
