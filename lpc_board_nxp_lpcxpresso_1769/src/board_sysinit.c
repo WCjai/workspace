@@ -24,6 +24,10 @@ void Board_SetupMuxing(void) {
 void Board_SetupClocking(void) {
     Chip_SetupXtalClocking();
     Chip_SYSCTL_SetFLASHAccess(FLASHTIM_100MHZ_CPU);
+    Chip_Clock_SetPCLKDiv(SYSCTL_PCLK_TIMER1, SYSCTL_CLKDIV_1);
+    Chip_Clock_SetPCLKDiv(SYSCTL_PCLK_TIMER2, SYSCTL_CLKDIV_1);
+    Chip_Clock_SetPCLKDiv(SYSCTL_PCLK_UART0, SYSCTL_CLKDIV_1);
+    Chip_Clock_SetPCLKDiv(SYSCTL_PCLK_UART1, SYSCTL_CLKDIV_1);
 }
 
 void Board_SystemInit(void) {

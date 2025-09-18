@@ -3,537 +3,419 @@
 #include <stdbool.h>
 #include <string.h>
 
-/* ---------------- FreeRTOS 7.x ---------------- */
-#include "FreeRTOS.h"
-#include "task.h"
-#include "queue.h"
-#include "semphr.h"
+/* ============================================================================
+   RX <-> APP protocol replica
+   - Upload-Map (connectors)
+   - RIT (100 ms) does BOTH:
+       • LED keep-alive streaming
+       • Slave polling: strict 1..N when no LED jobs active
+         (if LED activity interrupts a poll cycle, resume from 1..N)
+   - UART1 RX parses slave replies: 27 27 03 0A <addr> <state> 16
+     (state 0x01 idle/not triggered, 0x03 triggered)
+   - Heartbeat encodes 0x07 (alive+limit), 0x05 (alive), 0x00 (dead)
+   - Immediate limit/heartbeat updates for the *currently-streamed* slave
+     (even while general polling is paused)
+   ============================================================================ */
 
-/* ============================== Identity & UARTs ============================== */
-#define UART_APP        ((LPC_USART_T *)LPC_UART0)
+/* -------------------- UART selection -------------------- */
+#define UART_APP        LPC_UART0
 #define IRQ_APP         UART0_IRQn
 
-#define UART_SLAVE      ((LPC_USART_T *)LPC_UART1)
+#define UART_SLAVE      LPC_UART1       /* Slave bus on P2.0/P2.1 */
 #define IRQ_SLAVE       UART1_IRQn
 
-#define RIT_IRQN        RITIMER_IRQn
-/* =========================== Protocol constants ============================== */
+/* -------------------- RX identity -------------------- */
+#define RX_ID           0x01
+
+/* -------------------- Slave frames (per captures) -------------------- */
+#define SLAVE_LEN_ON      0x97
+#define SLAVE_LEN_OFF     0x97
+#define SLAVE_LEN_POLL    0x97
+
+/* -------------------- Protocol bytes -------------------- */
 enum { SOF = 0x27, END_BYTE = 0x16 };
 enum { GRP_APP_TO_RX = 0x85, GRP_RX_TO_APP = 0x00 };
 enum { SC_POLL = 0x00, SC_LED_CTRL = 0x02, SC_UPLOAD_MAP = 0x04, SC_LED_RESET = 0x3A, SC_RELAY_SET = 0x06 };
 enum { SC_STATUS = 0x0A };
 
-#define RX_ID           0x01
-#define APP_BAUD        19200
-#define SLAVE_BAUD      9600    /* set to your slave's actual baud */
+/* -------------------- Limits & buffers -------------------- */
+#define MAX_CFG         31
+#define RX_LEN_MAX      (4 + 2*MAX_CFG)        /* Upload-Map worst case */
+#define TX_FRAME_MAX    (MAX_CFG + 10)         /* heartbeat worst case */
 
-/* ================================ Timing ===================================== */
-/* Replicate original RX device cadence exactly */
-#define PING_PREMAP_MS      200u   /* broadcast ping before map upload */
-#define PING_AFTERMAP_MS    200u   /* per-connector ping after map     */
-#define TTL_MARGIN_MS       100u
+/* -------------------- Config (from Upload-Map) -------------------- */
+static uint8_t cfg_conn[MAX_CFG];   /* enabled connector IDs in order */
+static uint8_t cfg_count = 0;       /* N connectors => polling goes 1..N by array order */
 
-/* ================================ Limits ===================================== */
-#define MAX_CFG             31
-#define APP_RX_LEN_MAX      (4 + 2*MAX_CFG)   /* upload-map cap (N up to 31) */
-#define APP_TX_FRAME_MAX    (MAX_CFG + 10)    /* status frame cap */
+/* -------------------- Presence & limit-trigger (round snapshots) --------- */
+#define CONN_BIT(c) (1u << ((c) - 1))          /* connectors 1..31 -> bits 0..30 */
 
-/* ============================== Slave "lens" ================================= */
-/* If your slave uses true lengths (0x09/0x08), change here. You said 0x97. */
-#define SLAVE_LEN_PING  0x97
-#define SLAVE_LEN_ON    0x97
-#define SLAVE_LEN_OFF   0x97
+/* Collected during the ongoing poll round (set in UART1 IRQ) */
+static volatile uint32_t alive_round_mask     = 0;
+static volatile uint32_t triggered_round_mask = 0;
 
-/* ============================ Shared State =================================== */
-static uint8_t  cfg_conn[MAX_CFG];         /* enabled connectors in order */
-static uint8_t  cfg_count = 0;
+/* Snapshot committed at the start of each new poll round (used in heartbeat) */
+static volatile uint32_t g_alive_mask         = 0;
+static volatile uint32_t g_triggered_mask     = 0;
 
-static uint32_t last_seen_ms[32];          /* 1..31 valid; 0 means never */
-static uint8_t  limit_state[32];           /* 0x01 normal, 0x03 triggered */
-static uint32_t alive_ttl_ms = 200;
-
-static xSemaphoreHandle gStateMtx;
-
-/* FreeRTOS 7.x tick helpers */
-#define MS_TO_TICKS(ms)   ((portTickType)((ms) / portTICK_RATE_MS))
-#define NOW_TICKS()       (xTaskGetTickCount())
-#define NOW_MS()          ((uint32_t)(NOW_TICKS() * portTICK_RATE_MS))
-
-/* ============================== RX/TX Queues ================================= */
-/* RX byte queues: ISR -> parser tasks */
-static xQueueHandle qAppRxBytes;   /* UART0 RX bytes */
-static xQueueHandle qSlvRxBytes;   /* UART1 RX bytes */
-
-/* UART1 TX queues */
-typedef struct { uint8_t bytes[16]; uint8_t len; } slv_frame_t;
-/* ---- RIT IRQ name compatibility (LPCOpen uses RITIMER_IRQn) ---- */
-
-
-/* LED command (highest priority) */
-typedef struct { uint8_t con; uint8_t led; uint8_t state; bool reset_all; } slv_led_cmd_t;
-static xQueueHandle qSlvLedCmd;    /* LED commands */
-
-/* Pings (lower priority) */
-static xQueueHandle qSlvPing;      /* ping frames */
-
-/* UART0 TX queue: STATUS frames to APP */
-typedef struct { uint8_t bytes[APP_TX_FRAME_MAX]; uint8_t len; } app_frame_t;
-static xQueueHandle qAppTx;
-static xSemaphoreHandle qSlvTxKick;
-
-/* --------- forward declarations for helpers used before their definitions ---- */
-static void enqueue_status_frame_urgent_replace(void);
-static void enqueue_status_frame_coalesced(void);
-
-/* ============================ Internal helpers =============================== */
-static inline uint32_t per_connector_period_ms(void) {
-    return (cfg_count ? (uint32_t)cfg_count * PING_AFTERMAP_MS : PING_PREMAP_MS);
+static inline bool is_alive(uint8_t conn) {
+    return (conn >= 1 && conn <= 31) && ((g_alive_mask & CONN_BIT(conn)) != 0);
 }
-static void recompute_alive_ttl_locked(void){
-    uint32_t per = per_connector_period_ms();
-    uint32_t ttl = per * 2u + TTL_MARGIN_MS;
-    if (ttl < 120u) ttl = 120u;
-    if (ttl > 5000u) ttl = 5000u;
-    alive_ttl_ms = ttl;
-}
-static inline void alive_mark_seen_locked(uint8_t con, uint32_t now_ms){
-    if (con >= 1 && con <= 31) last_seen_ms[con] = now_ms;
-}
-static inline bool is_alive_locked(uint8_t con, uint32_t now_ms){
-    if (con < 1 || con > 31) return false;
-    uint32_t seen = last_seen_ms[con];
-    return (seen != 0u) && ((now_ms - seen) <= alive_ttl_ms);
+static inline bool is_triggered(uint8_t conn) {
+    return (conn >= 1 && conn <= 31) && ((g_triggered_mask & CONN_BIT(conn)) != 0);
 }
 
-/* UART blocking send for small frames (from *tasks* only) */
-static void uart_send_blocking(LPC_USART_T *U, const uint8_t *p, uint32_t n){
-    Chip_UART_SendBlocking(U, p, n);
+/* -------------------- UART1 TX queue (ISRs -> main) -------------------- */
+typedef struct { uint8_t data[9]; uint8_t len; } U1Frame;
+#define U1_TXQ_CAP  64
+
+static volatile uint8_t u1_head = 0, u1_tail = 0; /* ISR producer, main consumer */
+static U1Frame u1_q[U1_TXQ_CAP];
+
+static inline bool u1q_push_isr(const uint8_t *d, uint8_t n) {
+    uint8_t next = (uint8_t)((u1_head + 1) % U1_TXQ_CAP);
+    if (next == u1_tail) return false;            /* queue full: drop */
+    if (n > sizeof(u1_q[0].data)) n = sizeof(u1_q[0].data);
+    memcpy(u1_q[u1_head].data, d, n);
+    u1_q[u1_head].len = n;
+    u1_head = next;
+    return true;
+}
+static inline bool u1q_pop_main(U1Frame *out) {
+    if (u1_tail == u1_head) return false;
+    *out = u1_q[u1_tail];
+    u1_tail = (uint8_t)((u1_tail + 1) % U1_TXQ_CAP);
+    return true;
 }
 
-/* ========================== Build SLAVE frames =============================== */
-static inline void build_slave_ping_broadcast(slv_frame_t *f){
-    const uint8_t b[9] = { 0x27, SLAVE_LEN_PING, 0x05, 0x85, 0x00, 0x00, 0x00, 0x00, 0x16 };
-    memcpy(f->bytes, b, 9); f->len = 9;
+/* Enqueue slave frames (RIT uses these) */
+static inline void slave_enqueue_led_on(uint8_t con, uint8_t led) {
+    /* 27, 97, 05, 85, con, 02, 01, led, 16 */
+    uint8_t f[9] = { 0x27, SLAVE_LEN_ON, 0x05, 0x85, con, 0x02, 0x01, led, 0x16 };
+    (void)u1q_push_isr(f, sizeof f);
 }
-static inline void build_slave_ping_addr(slv_frame_t *f, uint8_t con){
-    const uint8_t b[9] = { 0x27, SLAVE_LEN_PING, 0x05, 0x85, con, 0x00, 0x00, 0x00, 0x16 };
-    memcpy(f->bytes, b, 9); f->len = 9;
+static inline void slave_enqueue_led_off_broadcast(void) {
+    /* 27, 97, 04, 85, FF, 03, 00, 16 (0x03 per your trace) */
+    uint8_t f[8] = { 0x27, SLAVE_LEN_OFF, 0x04, 0x85, 0xFF, 0x03, 0x00, 0x16 };
+    (void)u1q_push_isr(f, sizeof f);
 }
-static inline void build_slave_led_on(slv_frame_t *f, uint8_t con, uint8_t led){
-    const uint8_t b[9] = { 0x27, SLAVE_LEN_ON, 0x05, 0x85, con, 0x02, 0x01, led, 0x16 };
-    memcpy(f->bytes, b, 9); f->len = 9;
-}
-static inline void build_slave_led_off_all(slv_frame_t *f){
-    /* per your capture: FF 00 00 */
-    const uint8_t b[8] = { 0x27, SLAVE_LEN_OFF, 0x04, 0x85, 0xFF, 0x03, 0x00, 0x16 };
-    memcpy(f->bytes, b, 8); f->len = 8;
+static inline void slave_enqueue_poll(uint8_t con) {
+    /* 27, 97, 05, 85, con, 00, 00, 00, 16 */
+    uint8_t f[9] = { 0x27, SLAVE_LEN_POLL, 0x05, 0x85, con, 0x00, 0x00, 0x00, 0x16 };
+    (void)u1q_push_isr(f, sizeof f);
 }
 
-/* ============================ Build APP STATUS =============================== */
-static uint8_t build_status_locked(uint8_t *dst, uint8_t cap){
+/* -------------------- LED keep-alive jobs (RIT @ 100 ms) -------------------- */
+#define MAX_LED_JOBS    32
+
+typedef struct {
+    uint8_t  con;
+    uint8_t  led;
+    uint16_t next_allowed_tick;  /* rate-limit per job */
+    volatile uint8_t active;     /* write last to "commit" */
+} LedJob;
+
+static volatile LedJob g_jobs[MAX_LED_JOBS];
+static volatile uint8_t g_off_broadcast_pending = 0;
+
+/* RIT scheduling */
+#define RIT_TICK_MS                 70
+#define LED_JOB_MIN_PERIOD_TICKS    2   /* send same job at most every 200 ms */
+
+static volatile uint16_t g_tick = 0;    /* increments each RIT tick (wrap ok) */
+static uint8_t jobs_rr = 0;             /* round-robin index over job table */
+
+/* Streaming-active flag (read by UART1 IRQ for immediate updates) */
+static volatile bool g_led_streaming_active = false;
+
+/* -------------------- App (UART0) heartbeat -------------------- */
+static volatile uint8_t g_tx_len = 0;
+static uint8_t          g_tx_buf[TX_FRAME_MAX];
+
+static uint8_t build_status_frame(uint8_t *dst, uint8_t cap) {
     const uint8_t N = cfg_count;
-    const uint8_t LEN   = (uint8_t)(N + 7);
+    const uint8_t LEN = (uint8_t)(N + 7);
     const uint8_t TOTAL = (uint8_t)(LEN + 3);
     if (TOTAL > cap) return 0;
 
-    uint32_t now_ms = NOW_MS();
     uint8_t *p = dst;
-    *p++ = SOF;
-    *p++ = LEN;
-    *p++ = GRP_RX_TO_APP;
-    *p++ = RX_ID;
-    *p++ = SC_STATUS;
-    *p++ = 0x00;        /* flags */
-    *p++ = N;
-
-    for (uint8_t i = 0; i < N; ++i){
-        uint8_t con = cfg_conn[i];
-        uint8_t si  = 0x00;
-        if (is_alive_locked(con, now_ms)){
-            uint8_t lim = limit_state[con];
-            si = (lim == 0x03) ? 0x07 : 0x05;
-        }
-        *p++ = si;
+    *p++ = SOF; *p++ = LEN; *p++ = GRP_RX_TO_APP; *p++ = RX_ID; *p++ = SC_STATUS;
+    *p++ = 0x00; *p++ = N;
+    for (uint8_t i = 0; i < N; ++i) {
+        uint8_t c = cfg_conn[i];
+        uint8_t Si = 0x00;
+        if (is_alive(c)) Si = is_triggered(c) ? 0x07 : 0x05; /* 07=alive+limit, 05=alive */
+        *p++ = Si;
     }
     *p++ = 0x00; *p++ = 0x00; *p++ = END_BYTE;
     return TOTAL;
 }
-
-/* Push newest status; normal (FIFO) */
-static void enqueue_status_frame(void){
-    app_frame_t f;
-    xSemaphoreTake(gStateMtx, portMAX_DELAY);
-    uint8_t n = build_status_locked(f.bytes, sizeof(f.bytes));
-    xSemaphoreGive(gStateMtx);
-    if (n){ f.len = n; (void)xQueueSend(qAppTx, &f, 0); }
+static inline void send_status(void) {
+    uint8_t n = build_status_frame(g_tx_buf, sizeof(g_tx_buf));
+    if (n) g_tx_len = n;
 }
 
-/* ---- APP TX helpers: "latest-wins" for urgent, coalesced normal ---- */
-static inline unsigned portBASE_TYPE app_tx_has_pending(void) {
-    return (uxQueueMessagesWaiting(qAppTx) > 0);
-}
+/* -------------------- Command handlers (UART0) -------------------- */
+static void handle_upload_map(const uint8_t *pay, uint8_t paylen) {
+    if (paylen < 1) return;
+    const uint8_t N = pay[0];
+    if (paylen < (uint8_t)(1 + 2U * N)) return;
 
-/* Drop all pending, then enqueue the newest status (never blocks). */
-static void enqueue_status_frame_urgent_replace(void){
-    app_frame_t f;
-    xSemaphoreTake(gStateMtx, portMAX_DELAY);
-    uint8_t n = build_status_locked(f.bytes, sizeof(f.bytes));
-    xSemaphoreGive(gStateMtx);
-    if (!n) return;
-    f.len = n;
-
-    taskENTER_CRITICAL();          // avoid race with Task_AppTx dequeue
-    xQueueReset(qAppTx);           // drop any regular heartbeats
-    (void)xQueueSend(qAppTx, &f, 0);
-    taskEXIT_CRITICAL();
-}
-
-/* Enqueue a regular heartbeat only if none is pending (coalesce). */
-static void enqueue_status_frame_coalesced(void){
-    if (app_tx_has_pending()) return;  // drop; an older HB is still waiting
-    app_frame_t f;
-    xSemaphoreTake(gStateMtx, portMAX_DELAY);
-    uint8_t n = build_status_locked(f.bytes, sizeof(f.bytes));
-    xSemaphoreGive(gStateMtx);
-    if (!n) return;
-    f.len = n;
-    (void)xQueueSend(qAppTx, &f, 0);   // best-effort; never block
-}
-
-static void slv_tx_wake(void){
-    if (qSlvTxKick != NULL){
-        (void)xSemaphoreGive(qSlvTxKick);
-    }
-}
-
-/* ========================== App command handlers ============================= */
-static void handle_upload_map(const uint8_t *pay, uint8_t pal){
-    if (pal < 1) return;
-    uint8_t N = pay[0];
-    if (pal < (uint8_t)(1 + 2U*N)) return;
-
-    xSemaphoreTake(gStateMtx, portMAX_DELAY);
+    /* Fill cfg_conn[] in the order provided; round-robin will step 1..N by this order */
     cfg_count = 0;
-    for (uint8_t i = 0; i < N && cfg_count < MAX_CFG; ++i){
-        uint8_t con   = pay[1 + 2*i + 0];
-        uint8_t state = pay[1 + 2*i + 1];
-        if (state == 0x01) cfg_conn[cfg_count++] = con;
+    for (uint8_t i = 0; i < N && cfg_count < MAX_CFG; ++i) {
+        uint8_t c = pay[1 + 2*i + 0];
+        uint8_t s = pay[1 + 2*i + 1];
+        if (s == 0x01) cfg_conn[cfg_count++] = c;
     }
-    recompute_alive_ttl_locked();
-    xSemaphoreGive(gStateMtx);
-
-    /* Switch RIT cadence now that we know N (post-map = 50 ms) */
-    Chip_RIT_SetTimerInterval(LPC_RITIMER, (cfg_count == 0) ? PING_PREMAP_MS : PING_AFTERMAP_MS);
-
-    slv_tx_wake();
 }
-
-/* LED commands = highest priority:
-   - Drop stale LED frames so we always execute the latest intent.
-   - Enqueue OFF-ALL then ON (if state=1). */
-static void handle_led_ctrl(const uint8_t *pay, uint8_t pal){
-    if (pal < 3) return;
-    uint8_t state = pay[0];
-    uint8_t con   = pay[1];
-    uint8_t led   = pay[2];
-
-    /* Drop pending LED commands so we execute the freshest intent */
-    slv_led_cmd_t discard;
-    while (xQueueReceive(qSlvLedCmd, &discard, 0) == pdTRUE){}
-
-    slv_led_cmd_t cmd = {
-        .con = con,
-        .led = led,
-        .state = state ? 1u : 0u,
-        .reset_all = false
-    };
-    (void)xQueueSend(qSlvLedCmd, &cmd, 0);
-
-    slv_tx_wake();
-}
-
-static void handle_led_reset(void){
-    /* Flush any queued LED command and post a broadcast OFF */
-    slv_led_cmd_t discard;
-    while (xQueueReceive(qSlvLedCmd, &discard, 0) == pdTRUE){}
-
-    slv_led_cmd_t cmd = {
-        .con = 0u,
-        .led = 0u,
-        .state = 0u,
-        .reset_all = true
-    };
-    (void)xQueueSend(qSlvLedCmd, &cmd, 0);
-    slv_tx_wake();
-}
-
-extern void Board_Relay_Set(uint8_t relay, bool on);
-static void handle_relay_set(const uint8_t *pay, uint8_t pal){
-    if (pal < 2) return;
-    uint8_t relay = pay[0];
-    bool on = (pay[1] == 0x01);
-    Board_Relay_Set(relay, on);
-}
-
-/* ============================= Timer (RIT) =================================== */
-/* Use RIT as the deterministic 55ms/50ms ping scheduler. */
-static volatile uint8_t rit_rr = 0; /* round-robin index after map */
-
-void RIT_IRQHandler(void){
-    portBASE_TYPE hpw = pdFALSE;
-
-    /* Ack the interrupt */
-    Chip_RIT_ClearInt(LPC_RITIMER);
-
-    slv_frame_t f;
-
-    /* Snapshot count without lock (8-bit, atomic read). */
-    uint8_t n = cfg_count;
-
-    if (n == 0){
-        /* Pre-map: broadcast ping every 55 ms */
-        build_slave_ping_broadcast(&f);
-        (void)xQueueSendFromISR(qSlvPing, &f, &hpw);
+static void handle_led_ctrl(const uint8_t *pay, uint8_t paylen) {
+    if (paylen < 3) return;
+    uint8_t state = pay[0], con = pay[1], led = pay[2];
+    if (state) {
+        /* LED ON: start/maintain stream; polling will pause */
+        for (uint8_t i = 0; i < MAX_LED_JOBS; ++i) {
+            if (!g_jobs[i].active) {
+                g_jobs[i].con = con;
+                g_jobs[i].led = led;
+                g_jobs[i].next_allowed_tick = g_tick;  /* send immediately */
+                __DSB(); __ISB();
+                g_jobs[i].active = 1;
+                break;
+            }
+        }
     } else {
-        /* Post-map: per-connector round-robin every 50 ms */
-        if (rit_rr >= n) rit_rr = 0;
-        uint8_t con = cfg_conn[rit_rr++];
-        build_slave_ping_addr(&f, con);
-        (void)xQueueSendFromISR(qSlvPing, &f, &hpw);
+        /* LED OFF: stop that job; broadcast OFF once */
+        for (uint8_t i = 0; i < MAX_LED_JOBS; ++i) {
+            if (g_jobs[i].active && g_jobs[i].con == con && g_jobs[i].led == led) {
+                g_jobs[i].active = 0;
+                break;
+            }
+        }
+        g_off_broadcast_pending = 1;
     }
-
-    /* Wake the UART1 TX worker */
-    if (qSlvTxKick) xSemaphoreGiveFromISR(qSlvTxKick, &hpw);
-
-    portYIELD_FROM_ISR(hpw);
+}
+static void handle_led_reset(const uint8_t *pay, uint8_t paylen) {
+    (void)pay; (void)paylen;
+    for (uint8_t i = 0; i < MAX_LED_JOBS; ++i) g_jobs[i].active = 0;
+    g_off_broadcast_pending = 1;
+}
+static void handle_relay_set(const uint8_t *pay, uint8_t paylen) {
+    if (paylen < 2) return;
+    Board_Relay_Set(pay[0], (pay[1] == 0x01));
 }
 
-static void init_rit(uint32_t period_ms){
-    Chip_RIT_Init(LPC_RITIMER);
-    Chip_RIT_SetTimerInterval(LPC_RITIMER, period_ms);
-    NVIC_SetPriority(RITIMER_IRQn, configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY + 1);
-    NVIC_EnableIRQ(RITIMER_IRQn);
+/* -------------------- UART0 RX parser (App->RX) -------------------- */
+typedef enum { RXF_WAIT_SOF=0, RXF_WAIT_LEN, RXF_COLLECT_BODY, RXF_WAIT_END } rx_fsm_t;
+static volatile rx_fsm_t rx_state = RXF_WAIT_SOF;
+static volatile uint8_t  rx_len   = 0;
+static uint8_t           rx_buf[RX_LEN_MAX];
+static uint8_t           rx_idx   = 0;
+
+static void dispatch_body(const uint8_t *p, uint8_t len) {
+    if (len < 3) return;
+    uint8_t group = p[0], id = p[1], sc = p[2];
+    const uint8_t *pay = (len > 3) ? &p[3] : NULL;
+    uint8_t pal = (len > 3) ? (uint8_t)(len - 3) : 0;
+
+    if (group != GRP_APP_TO_RX || id != RX_ID) return;
+
+    switch (sc) {
+        case SC_POLL:        /* payload 00 */                 break;
+        case SC_UPLOAD_MAP:  handle_upload_map(pay, pal);     break;
+        case SC_LED_CTRL:    handle_led_ctrl(pay, pal);       break;
+        case SC_LED_RESET:   handle_led_reset(pay, pal);      break;
+        case SC_RELAY_SET:   handle_relay_set(pay, pal);      break;
+        default: break;
+    }
+    /* Always reply with status after any valid command */
+    send_status();
 }
 
-
-/* ============================= Tasks & ISRs ================================== */
-/* UART0 ISR: push bytes to qAppRxBytes */
-void UART0_IRQHandler(void){
-    portBASE_TYPE hpw = pdFALSE;
-    while (Chip_UART_ReadLineStatus(UART_APP) & UART_LSR_RDR){
+void UART0_IRQHandler(void) {
+    while ((Chip_UART_ReadLineStatus(UART_APP) & UART_LSR_RDR) != 0) {
         uint8_t b = Chip_UART_ReadByte(UART_APP);
-        xQueueSendFromISR(qAppRxBytes, &b, &hpw);
-    }
-    portYIELD_FROM_ISR(hpw);
-}
-
-/* UART1 ISR: push bytes to qSlvRxBytes */
-void UART1_IRQHandler(void){
-    portBASE_TYPE hpw = pdFALSE;
-    while (Chip_UART_ReadLineStatus(UART_SLAVE) & UART_LSR_RDR){
-        uint8_t b = Chip_UART_ReadByte(UART_SLAVE);
-        xQueueSendFromISR(qSlvRxBytes, &b, &hpw);
-    }
-    portYIELD_FROM_ISR(hpw);
-}
-
-/* Task: APP RX parser (UART0) */
-static void Task_AppParser(void *arg){
-    (void)arg;
-    enum { RXF_WAIT_SOF=0, RXF_WAIT_LEN, RXF_COLLECT, RXF_WAIT_END } st = RXF_WAIT_SOF;
-    uint8_t len = 0, idx = 0, buf[APP_RX_LEN_MAX];
-
-    for (;;){
-        uint8_t b;
-        if (xQueueReceive(qAppRxBytes, &b, portMAX_DELAY) != pdTRUE) continue;
-
-        switch (st){
-        case RXF_WAIT_SOF:   if (b == SOF) st = RXF_WAIT_LEN; break;
+        switch (rx_state) {
+        case RXF_WAIT_SOF:      if (b == SOF) rx_state = RXF_WAIT_LEN; break;
         case RXF_WAIT_LEN:
-            len = b;
-            if (!len || len > APP_RX_LEN_MAX){ st = RXF_WAIT_SOF; break; }
-            idx = 0; st = RXF_COLLECT; break;
-        case RXF_COLLECT:
-            buf[idx++] = b;
-            if (idx == len) st = RXF_WAIT_END;
+            rx_len = b; rx_idx = 0;
+            if (!rx_len || rx_len > RX_LEN_MAX) { rx_state = RXF_WAIT_SOF; break; }
+            rx_state = RXF_COLLECT_BODY; break;
+        case RXF_COLLECT_BODY:
+            if (rx_idx < RX_LEN_MAX) {
+                rx_buf[rx_idx++] = b;
+                if (rx_idx == rx_len) rx_state = RXF_WAIT_END;
+            } else rx_state = RXF_WAIT_SOF;
             break;
         case RXF_WAIT_END:
-            if (b == END_BYTE){
-                if (len >= 3){
-                    uint8_t group = buf[0], id = buf[1], sc = buf[2];
-                    const uint8_t *pay = (len > 3) ? &buf[3] : NULL;
-                    uint8_t pal = (len > 3) ? (uint8_t)(len - 3) : 0;
+            if (b == END_BYTE) dispatch_body(rx_buf, rx_len);
+            rx_state = RXF_WAIT_SOF; break;
+        default: rx_state = RXF_WAIT_SOF; break;
+        }
+    }
+}
 
-                    if (group == GRP_APP_TO_RX && id == RX_ID){
-                        switch (sc){
-                            case SC_POLL:        break; /* HB below */
-                            case SC_UPLOAD_MAP:  handle_upload_map(pay, pal);  break;
-                            case SC_LED_CTRL:    handle_led_ctrl(pay, pal);    break;
-                            case SC_LED_RESET:   handle_led_reset();           break;
-                            case SC_RELAY_SET:   handle_relay_set(pay, pal);   break;
-                            default: break;
-                        }
-                        /* Heartbeat for ANY command (coalesced) */
-                        enqueue_status_frame_coalesced();
+/* -------------------- UART1 RX parser (Slave->RX) -------------------- */
+/* Accepts: 27 27 03 0A <addr> <state> 16
+   state: 0x01=idle/not triggered, 0x03=triggered (both imply "alive") */
+typedef enum { U1_WAIT_SOF=0, U1_GOT_SOF, U1_WAIT_LEN, U1_COLLECT, U1_WAIT_END } u1_fsm_t;
+static volatile u1_fsm_t u1_state = U1_WAIT_SOF;
+static volatile uint8_t  u1_len   = 0, u1_idx = 0;
+static uint8_t           u1_pay[8];
+
+void UART1_IRQHandler(void) {
+    while (Chip_UART_ReadLineStatus(UART_SLAVE) & UART_LSR_RDR) {
+        uint8_t b = Chip_UART_ReadByte(UART_SLAVE);
+        switch (u1_state) {
+        case U1_WAIT_SOF:  if (b == 0x27) u1_state = U1_GOT_SOF; break;
+        case U1_GOT_SOF:   if (b == 0x27) u1_state = U1_WAIT_LEN;
+                           else { u1_len = b; u1_idx = 0; if (!u1_len || u1_len > sizeof(u1_pay)) { u1_state = U1_WAIT_SOF; break; } u1_state = U1_COLLECT; }
+                           break;
+        case U1_WAIT_LEN:  u1_len = b; u1_idx = 0;
+                           if (!u1_len || u1_len > sizeof(u1_pay)) { u1_state = U1_WAIT_SOF; break; }
+                           u1_state = U1_COLLECT; break;
+        case U1_COLLECT:   u1_pay[u1_idx++] = b;
+                           if (u1_idx == u1_len) u1_state = U1_WAIT_END; break;
+        case U1_WAIT_END:
+            if (b == 0x16 && u1_len == 3 && u1_pay[0] == 0x0A) {
+                uint8_t addr = u1_pay[1], st = u1_pay[2];
+                if (addr >= 1 && addr <= 31 && st != 0x00) {
+                    uint32_t bit = CONN_BIT(addr);
+                    /* Per-round masks (for next commit when polling runs) */
+                    alive_round_mask |= bit;
+                    if (st == 0x03) triggered_round_mask |= bit; else triggered_round_mask &= ~bit;
+
+                    /* === Immediate update during LED streaming === */
+                    if (g_led_streaming_active) {
+                        g_alive_mask |= bit;                         /* replying => alive */
+                        if (st == 0x03) g_triggered_mask |= bit;
+                        else            g_triggered_mask &= ~bit;    /* clear if not triggered */
                     }
                 }
             }
-            st = RXF_WAIT_SOF;
-            break;
+            u1_state = U1_WAIT_SOF; break;
+        default: u1_state = U1_WAIT_SOF; break;
         }
     }
 }
 
-/* Task: SLAVE RX parser (UART1)
-   Expected: 27 27 03 0A <addr> <limit> 16 */
-static void Task_SlvRxParser(void *arg){
-    (void)arg;
-    enum { SLP_WAIT_SOF=0, SLP_GOT_SOF2, SLP_WAIT_LEN, SLP_WAIT_CMD, SLP_WAIT_ADDR, SLP_WAIT_LIMIT, SLP_WAIT_END } st = SLP_WAIT_SOF;
-    uint8_t addr=0, lim=0;
+/* -------------------- RIT: 100 ms (LED + polling) -------------------- */
+static volatile uint8_t  poll_rr_idx    = 0;   /* 0..(cfg_count-1) */
+static volatile bool     led_active_prev = false;
 
-    for (;;){
-        uint8_t b;
-        if (xQueueReceive(qSlvRxBytes, &b, portMAX_DELAY) != pdTRUE) continue;
+static inline void commit_and_clear_poll_round(void) {
+    /* Commit last round (whatever we gathered), then clear accumulators */
+    g_alive_mask         = alive_round_mask;
+    g_triggered_mask     = triggered_round_mask & g_alive_mask; /* trigger only if alive */
+    alive_round_mask     = 0;
+    triggered_round_mask = 0;
+}
 
-        switch (st){
-        case SLP_WAIT_SOF:    if (b==0x27) st=SLP_GOT_SOF2; break;
-        case SLP_GOT_SOF2:    st=SLP_WAIT_LEN; break;
-        case SLP_WAIT_LEN:    st = (b==0x03) ? SLP_WAIT_CMD : SLP_WAIT_SOF; break;
-        case SLP_WAIT_CMD:    st = (b==0x0A) ? SLP_WAIT_ADDR: SLP_WAIT_SOF; break;
-        case SLP_WAIT_ADDR:   addr=b; st=SLP_WAIT_LIMIT; break;
-        case SLP_WAIT_LIMIT:  lim=b;  st=SLP_WAIT_END;   break;
-        case SLP_WAIT_END:
-            if (b == END_BYTE){
-                uint32_t now_ms = NOW_MS();
-                uint8_t prev_lim;
+void RIT_IRQHandler(void) {
+    Chip_RIT_ClearInt(LPC_RITIMER);
+    g_tick++;
 
-                xSemaphoreTake(gStateMtx, portMAX_DELAY);
-                alive_mark_seen_locked(addr, now_ms);
-                prev_lim = (addr>=1 && addr<=31) ? limit_state[addr] : 0x01;
-                if (addr>=1 && addr<=31) limit_state[addr] = lim;  /* 0x01 or 0x03 */
-                xSemaphoreGive(gStateMtx);
+    /* One-time broadcast OFF if requested */
+    if (g_off_broadcast_pending) {
+        slave_enqueue_led_off_broadcast();
+        g_off_broadcast_pending = 0;
+    }
 
-                if (lim != prev_lim) {
-                    /* GUARANTEE: replace any pending heartbeats with this updated one */
-                    enqueue_status_frame_urgent_replace();
-                }
+    /* LED streaming takes precedence; pause polling while active */
+    bool led_active_now = false;
+    for (uint8_t i = 0; i < MAX_LED_JOBS; ++i) { if (g_jobs[i].active) { led_active_now = true; break; } }
+    g_led_streaming_active = led_active_now;
+
+    if (led_active_now) {
+        /* entering LED mode? remember we were interrupted */
+        led_active_prev = true;
+
+        /* round-robin exactly ONE LED job per tick, with per-job rate limit */
+        for (uint8_t k = 0; k < MAX_LED_JOBS; ++k) {
+            uint8_t i = (uint8_t)((jobs_rr + k) % MAX_LED_JOBS);
+            if (!g_jobs[i].active) continue;
+            if ((int16_t)(g_tick - g_jobs[i].next_allowed_tick) >= 0) {
+                slave_enqueue_led_on(g_jobs[i].con, g_jobs[i].led);
+                g_jobs[i].next_allowed_tick = (uint16_t)(g_tick + LED_JOB_MIN_PERIOD_TICKS);
+                jobs_rr = (uint8_t)((i + 1) % MAX_LED_JOBS);
+                break;  /* only one job per tick */
             }
-            st = SLP_WAIT_SOF;
-            break;
         }
+        return;    /* no round-robin polling while LEDs stream */
     }
-}
 
-/* Task: SLAVE TX (LED queue has priority over ping queue) */
-static void Task_SlvTx(void *arg){
-    (void)arg;
-    slv_frame_t f;
-    slv_led_cmd_t led;
-    for (;;){
-        bool have_led = false;
-        while (xQueueReceive(qSlvLedCmd, &led, 0) == pdTRUE){
-            have_led = true;
-        }
-        if (have_led){
-            build_slave_led_off_all(&f);                  /* OFF-all first */
-            uart_send_blocking(UART_SLAVE, f.bytes, f.len);
-            if (!led.reset_all && led.state){
-                build_slave_led_on(&f, led.con, led.led); /* then ON if requested */
-                uart_send_blocking(UART_SLAVE, f.bytes, f.len);
-            }
-            continue;
-        }
-
-        if (xQueueReceive(qSlvPing, &f, 0) == pdTRUE){
-            uart_send_blocking(UART_SLAVE, f.bytes, f.len);
-            continue;
-        }
-
-        if (qSlvTxKick != NULL){
-            (void)xSemaphoreTake(qSlvTxKick, portMAX_DELAY);
-        } else {
-            taskYIELD();
-        }
+    /* LED mode ended: DO NOT commit/clear snapshot here (avoid zero-list blip).
+       Just restart poll sequence from the beginning (1..N). */
+    if (led_active_prev) {
+        led_active_prev = false;
+        poll_rr_idx = 0;         /* resume at connector #1 */
+        /* keep g_alive_mask/g_triggered_mask as-is until next round commit */
     }
-}
 
-/* Task: APP TX (send STATUS frames) */
-static void Task_AppTx(void *arg){
-    (void)arg; app_frame_t f;
-    for (;;){
-        if (xQueueReceive(qAppTx, &f, portMAX_DELAY) == pdTRUE){
-            uart_send_blocking(UART_APP, f.bytes, f.len);
-        }
+    /* Polling mode */
+    if (cfg_count == 0) return;  /* nothing to poll until Upload-Map */
+
+    /* At the START of each new round (idx==0), commit previous round and clear accumulators */
+    if (poll_rr_idx == 0) {
+        commit_and_clear_poll_round();
     }
+
+    /* Strict 1..N order by cfg_conn[] contents */
+    uint8_t con = cfg_conn[poll_rr_idx];
+    slave_enqueue_poll(con);
+
+    /* Advance, wrap to 0 => next tick starts a new round and commits previous */
+    poll_rr_idx++;
+    if (poll_rr_idx >= cfg_count) poll_rr_idx = 0;
 }
 
-/* ============================== Hardware init ================================ */
-static void init_uart_app(void){
-    Chip_UART_Init(UART_APP);
-    Chip_UART_SetBaud(UART_APP, APP_BAUD);
-    Chip_UART_ConfigData(UART_APP, UART_LCR_WLEN8 | UART_LCR_SBS_1BIT);
-    Chip_UART_SetupFIFOS(UART_APP, UART_FCR_FIFO_EN | UART_FCR_TRG_LEV2);
-    Chip_UART_TXEnable(UART_APP);
-    Chip_UART_IntEnable(UART_APP, UART_IER_RBRINT | UART_IER_RLSINT);
-    /* Priorities: must be numerically >= configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY */
-    NVIC_SetPriority(IRQ_APP, configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY + 3);
-    NVIC_EnableIRQ(IRQ_APP);
-}
-static void init_uart_slave(void){
-    Chip_UART_Init(UART_SLAVE);
-    Chip_UART_SetBaud(UART_SLAVE, SLAVE_BAUD);
-    Chip_UART_ConfigData(UART_SLAVE, UART_LCR_WLEN8 | UART_LCR_SBS_1BIT);
-    Chip_UART_SetupFIFOS(UART_SLAVE, UART_FCR_FIFO_EN | UART_FCR_TRG_LEV2);
-    Chip_UART_TXEnable(UART_SLAVE);
-    Chip_UART_IntEnable(UART_SLAVE, UART_IER_RBRINT | UART_IER_RLSINT);
-    NVIC_SetPriority(IRQ_SLAVE, configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY + 2);
-    NVIC_EnableIRQ(IRQ_SLAVE);
-}
-
-/* ================================= main() ==================================== */
-int main(void){
+/* -------------------- Main -------------------- */
+int main(void) {
     SystemCoreClockUpdate();
     Board_Init();
 
-    /* Mutex */
-    gStateMtx = xSemaphoreCreateMutex();
+    /* UART0 (APP link): 19,200 8N1 */
+    Chip_UART_Init(UART_APP);
+    Chip_UART_SetBaud(UART_APP, 19200);
+    Chip_UART_ConfigData(UART_APP, UART_LCR_WLEN8 | UART_LCR_SBS_1BIT);
+    Chip_UART_SetupFIFOS(UART_APP, UART_FCR_FIFO_EN | UART_FCR_TRG_LEV2);
+    Chip_UART_TXEnable(UART_APP);
 
-    /* Queues */
-    qAppRxBytes = xQueueCreate(256, sizeof(uint8_t));
-    qSlvRxBytes = xQueueCreate(256, sizeof(uint8_t));
-    qSlvLedCmd  = xQueueCreate(4, sizeof(slv_led_cmd_t));  /* LED commands */
-    qSlvPing    = xQueueCreate(8, sizeof(slv_frame_t));    /* pings: low-priority */
-    qAppTx      = xQueueCreate(6, sizeof(app_frame_t));    /* allow bursts */
-    vSemaphoreCreateBinary(qSlvTxKick);   /* v7 API */
-    configASSERT(qSlvTxKick);
-    configASSERT(qSlvLedCmd);
-    /* Make it initially empty (modern behavior) */
-    xSemaphoreTake(qSlvTxKick, 0);
+    /* UART1 (SLAVE link): 9600 8N1 (per your setup) */
+    Chip_UART_Init(UART_SLAVE);
+    Chip_UART_SetBaud(UART_SLAVE, 9600);
+    Chip_UART_ConfigData(UART_SLAVE, UART_LCR_WLEN8 | UART_LCR_SBS_1BIT);
+    Chip_UART_SetupFIFOS(UART_SLAVE, UART_FCR_FIFO_EN | UART_FCR_TRG_LEV2);
+    Chip_UART_TXEnable(UART_SLAVE);
 
-    /* Shared-state defaults */
-    xSemaphoreTake(gStateMtx, portMAX_DELAY);
-    memset(last_seen_ms, 0, sizeof(last_seen_ms));
-    for (int i=0;i<32;++i) limit_state[i] = 0x01;
-    recompute_alive_ttl_locked();
-    xSemaphoreGive(gStateMtx);
+    /* Enable UART IRQs */
+    Chip_UART_IntEnable(UART_APP,   UART_IER_RBRINT | UART_IER_RLSINT);
+    NVIC_SetPriority(IRQ_APP,   3);
+    NVIC_EnableIRQ(IRQ_APP);
 
-    /* UARTs */
-    init_uart_app();
-    init_uart_slave();
+    Chip_UART_IntEnable(UART_SLAVE, UART_IER_RBRINT | UART_IER_RLSINT);
+    NVIC_SetPriority(IRQ_SLAVE, 2);
+    NVIC_EnableIRQ(IRQ_SLAVE);
 
-    /* Start RIT for pre-map cadence (55 ms). It will be switched to 50 ms after map. */
-    init_rit(PING_PREMAP_MS);
+    /* RIT: 100 ms period does LED publishing AND polling */
+    Chip_RIT_Init(LPC_RITIMER);
+    Chip_RIT_SetTimerInterval(LPC_RITIMER, RIT_TICK_MS);
+    NVIC_ClearPendingIRQ(RITIMER_IRQn);
+    NVIC_SetPriority(RITIMER_IRQn, 1);
+    NVIC_EnableIRQ(RITIMER_IRQn);
 
-    /* Task priorities:
-       - Make APP TX high so urgent limit-change frames go quickly.
-       - Keep LED TX high for UART1, then RX parsers. (No pinger task now.) */
-    xTaskCreate(Task_AppTx,       (signed char*)"appTx",   configMINIMAL_STACK_SIZE + 128, NULL, (tskIDLE_PRIORITY+6), NULL);
-    xTaskCreate(Task_SlvTx,       (signed char*)"slvTx",   configMINIMAL_STACK_SIZE + 128, NULL, (tskIDLE_PRIORITY+5), NULL);
-    xTaskCreate(Task_AppParser,   (signed char*)"appRx",   configMINIMAL_STACK_SIZE + 256, NULL, (tskIDLE_PRIORITY+3), NULL);
-    xTaskCreate(Task_SlvRxParser, (signed char*)"slvRx",   configMINIMAL_STACK_SIZE + 256, NULL, (tskIDLE_PRIORITY+3), NULL);
-
-    vTaskStartScheduler();
-    for(;;){}
+    for (;;) {
+        /* Flush heartbeat (UART0) */
+        if (g_tx_len) {
+            uint8_t n = g_tx_len;
+            Chip_UART_SendBlocking(UART_APP, g_tx_buf, n);
+            g_tx_len = 0;
+        }
+        /* Flush at most one UART1 frame per loop to avoid long blocking bursts */
+        U1Frame fr;
+        if (u1q_pop_main(&fr)) {
+            Chip_UART_SendBlocking(UART_SLAVE, fr.data, fr.len);
+        }
+        __WFI();
+    }
 }
-
-/* Board_Relay_Set(...) is provided in your board layer */

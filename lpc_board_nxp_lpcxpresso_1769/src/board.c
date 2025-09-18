@@ -24,8 +24,11 @@ static const relay_pin_t kRelayPins[6] = {
    { RELAY6_GPIO_PORT_NUM, RELAY6_GPIO_BIT_NUM },
 };
 
-const uint32_t OscRateIn    = 12000000;
-const uint32_t RTCOscRateIn = 32768;
+//const uint32_t OscRateIn    = 12000000;
+//const uint32_t RTCOscRateIn = 32768;
+
+const uint32_t OscRateIn   = 12000000;   // main oscillator input
+const uint32_t RTCOscRateIn = 0;         // or 32768 if you have an RTC crystal
 
 void Board_Relays_Init(void) {
     for (unsigned i = 0; i < 6; ++i) {
