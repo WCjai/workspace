@@ -14,6 +14,9 @@ STATIC const PINMUX_GRP_T pinmuxing[] = {
     {0,  6, IOCON_MODE_INACT | IOCON_FUNC0}, /* Relay 4 */
     {0,  7, IOCON_MODE_INACT | IOCON_FUNC0}, /* Relay 5 */
     {0,  8, IOCON_MODE_INACT | IOCON_FUNC0}, /* Relay 6 */
+
+	{3, 26, IOCON_FUNC0 | IOCON_MODE_INACT},
+	{3, 25, IOCON_FUNC0 | IOCON_MODE_INACT},
 };
 
 void Board_SetupMuxing(void) {

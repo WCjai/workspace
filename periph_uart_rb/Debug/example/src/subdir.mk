@@ -6,17 +6,20 @@
 C_SRCS += \
 ../example/src/cr_startup_lpc175x_6x.c \
 ../example/src/sysinit.c \
-../example/src/uart_rb.c 
+../example/src/uart_rb.c \
+../example/src/ws2812b.c 
 
 C_DEPS += \
 ./example/src/cr_startup_lpc175x_6x.d \
 ./example/src/sysinit.d \
-./example/src/uart_rb.d 
+./example/src/uart_rb.d \
+./example/src/ws2812b.d 
 
 OBJS += \
 ./example/src/cr_startup_lpc175x_6x.o \
 ./example/src/sysinit.o \
-./example/src/uart_rb.o 
+./example/src/uart_rb.o \
+./example/src/ws2812b.o 
 
 
 # Each subdirectory must supply rules for building sources it contributes
@@ -31,7 +34,7 @@ example/src/%.o: ../example/src/%.c example/src/subdir.mk
 clean: clean-example-2f-src
 
 clean-example-2f-src:
-	-$(RM) ./example/src/cr_startup_lpc175x_6x.d ./example/src/cr_startup_lpc175x_6x.o ./example/src/sysinit.d ./example/src/sysinit.o ./example/src/uart_rb.d ./example/src/uart_rb.o
+	-$(RM) ./example/src/cr_startup_lpc175x_6x.d ./example/src/cr_startup_lpc175x_6x.o ./example/src/sysinit.d ./example/src/sysinit.o ./example/src/uart_rb.d ./example/src/uart_rb.o ./example/src/ws2812b.d ./example/src/ws2812b.o
 
 .PHONY: clean-example-2f-src
 

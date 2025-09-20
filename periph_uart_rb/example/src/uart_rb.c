@@ -3,18 +3,23 @@
 #include <stdbool.h>
 #include <string.h>
 
+/* ===== WS2812B driver ===== */
+#include "ws2812b.h"    /* needs RGB_t, WS2812B, WS2812B_write(...) */
+
 /* ============================================================================
-   RX <-> APP protocol replica
+   RX <-> APP protocol replica + WS2812B accessory
    - Upload-Map (connectors)
-   - RIT (100 ms) does BOTH:
+   - RIT (70 ms) does BOTH:
        • LED keep-alive streaming
        • Slave polling: strict 1..N when no LED jobs active
          (if LED activity interrupts a poll cycle, resume from 1..N)
+       • WS2812B flush if any strip changed
    - UART1 RX parses slave replies: 27 27 03 0A <addr> <state> 16
      (state 0x01 idle/not triggered, 0x03 triggered)
    - Heartbeat encodes 0x07 (alive+limit), 0x05 (alive), 0x00 (dead)
    - Immediate limit/heartbeat updates for the *currently-streamed* slave
      (even while general polling is paused)
+   - New App command (LEN=0x0C) drives WS2812B: BIN=1(B1=P3.25)/2(B2=P3.26), LED#
    ============================================================================ */
 
 /* -------------------- UART selection -------------------- */
@@ -50,11 +55,9 @@ static uint8_t cfg_count = 0;       /* N connectors => polling goes 1..N by arra
 /* -------------------- Presence & limit-trigger (round snapshots) --------- */
 #define CONN_BIT(c) (1u << ((c) - 1))          /* connectors 1..31 -> bits 0..30 */
 
-/* Collected during the ongoing poll round (set in UART1 IRQ) */
 static volatile uint32_t alive_round_mask     = 0;
 static volatile uint32_t triggered_round_mask = 0;
 
-/* Snapshot committed at the start of each new poll round (used in heartbeat) */
 static volatile uint32_t g_alive_mask         = 0;
 static volatile uint32_t g_triggered_mask     = 0;
 
@@ -105,7 +108,7 @@ static inline void slave_enqueue_poll(uint8_t con) {
     (void)u1q_push_isr(f, sizeof f);
 }
 
-/* -------------------- LED keep-alive jobs (RIT @ 100 ms) -------------------- */
+/* -------------------- LED keep-alive jobs (RIT @ 70 ms) -------------------- */
 #define MAX_LED_JOBS    32
 
 typedef struct {
@@ -120,7 +123,7 @@ static volatile uint8_t g_off_broadcast_pending = 0;
 
 /* RIT scheduling */
 #define RIT_TICK_MS                 70
-#define LED_JOB_MIN_PERIOD_TICKS    2   /* send same job at most every 200 ms */
+#define LED_JOB_MIN_PERIOD_TICKS    2   /* send same job at most every 140 ms */
 
 static volatile uint16_t g_tick = 0;    /* increments each RIT tick (wrap ok) */
 static uint8_t jobs_rr = 0;             /* round-robin index over job table */
@@ -155,13 +158,46 @@ static inline void send_status(void) {
     if (n) g_tx_len = n;
 }
 
+/* -------------------- WS2812B: two strips on B1=P3.25, B2=P3.26 ----------- */
+#define WS_LED_COUNT  96
+
+static RGB_t ws_buf_b1[WS_LED_COUNT];
+static RGB_t ws_buf_b2[WS_LED_COUNT];
+static WS2812B ws_b1 = { .leds = ws_buf_b1, .num_leds = WS_LED_COUNT };
+static WS2812B ws_b2 = { .leds = ws_buf_b2, .num_leds = WS_LED_COUNT };
+static volatile bool ws_dirty_b1 = false, ws_dirty_b2 = false;
+
+static inline void ws_clear(RGB_t *buf, uint16_t n) { memset(buf, 0, n * sizeof(RGB_t)); }
+static inline void ws_set_red(RGB_t *buf, uint16_t n, uint16_t led1) {
+    if (led1 == 0 || led1 > n) return;
+    uint16_t idx = (uint16_t)(led1 - 1);
+    buf[idx].r = 255; buf[idx].g = 0; buf[idx].b = 0;   /* swap if your driver expects GRB */
+}
+static inline void ws_flush_if_dirty(void) {
+    if (ws_dirty_b1) { WS2812B_write(&ws_b1); ws_dirty_b1 = false; }
+    if (ws_dirty_b2) { WS2812B_write(&ws_b2); ws_dirty_b2 = false; }
+}
+
+/* Try to parse WS accessory LED command inside SC_LED_CTRL payload:
+   Expected payload (pal>=9): 00 00 00 02 <BIN> <LED#> 00 00 00
+   BIN: 1=B1(P3.25), 2=B2(P3.26), LED# 1..WS_LED_COUNT
+*/
+static bool try_handle_ws_accessory(const uint8_t *pay, uint8_t pal) {
+    if (pal < 9) return false;
+    if (pay[0] != 0x00 || pay[1] != 0x00 || pay[2] != 0x00) return false;
+    if (pay[3] != 0x02) return false;
+    uint8_t bin = pay[4], led = pay[5];
+    if (bin == 1) { ws_set_red(ws_buf_b1, WS_LED_COUNT, led); ws_dirty_b1 = true; return true; }
+    if (bin == 2) { ws_set_red(ws_buf_b2, WS_LED_COUNT, led); ws_dirty_b2 = true; return true; }
+    return false;
+}
+
 /* -------------------- Command handlers (UART0) -------------------- */
 static void handle_upload_map(const uint8_t *pay, uint8_t paylen) {
     if (paylen < 1) return;
     const uint8_t N = pay[0];
     if (paylen < (uint8_t)(1 + 2U * N)) return;
 
-    /* Fill cfg_conn[] in the order provided; round-robin will step 1..N by this order */
     cfg_count = 0;
     for (uint8_t i = 0; i < N && cfg_count < MAX_CFG; ++i) {
         uint8_t c = pay[1 + 2*i + 0];
@@ -169,11 +205,15 @@ static void handle_upload_map(const uint8_t *pay, uint8_t paylen) {
         if (s == 0x01) cfg_conn[cfg_count++] = c;
     }
 }
+
 static void handle_led_ctrl(const uint8_t *pay, uint8_t paylen) {
+    /* First handle WS accessory command if present */
+    if (try_handle_ws_accessory(pay, paylen)) return;
+
+    /* Else: legacy 3-byte LED control for slave boards */
     if (paylen < 3) return;
     uint8_t state = pay[0], con = pay[1], led = pay[2];
     if (state) {
-        /* LED ON: start/maintain stream; polling will pause */
         for (uint8_t i = 0; i < MAX_LED_JOBS; ++i) {
             if (!g_jobs[i].active) {
                 g_jobs[i].con = con;
@@ -185,7 +225,6 @@ static void handle_led_ctrl(const uint8_t *pay, uint8_t paylen) {
             }
         }
     } else {
-        /* LED OFF: stop that job; broadcast OFF once */
         for (uint8_t i = 0; i < MAX_LED_JOBS; ++i) {
             if (g_jobs[i].active && g_jobs[i].con == con && g_jobs[i].led == led) {
                 g_jobs[i].active = 0;
@@ -193,13 +232,20 @@ static void handle_led_ctrl(const uint8_t *pay, uint8_t paylen) {
             }
         }
         g_off_broadcast_pending = 1;
+        /* Note: WS strips are cleared by LED_RESET, not by per-conn OFF. */
     }
 }
+
 static void handle_led_reset(const uint8_t *pay, uint8_t paylen) {
     (void)pay; (void)paylen;
     for (uint8_t i = 0; i < MAX_LED_JOBS; ++i) g_jobs[i].active = 0;
     g_off_broadcast_pending = 1;
+
+    /* Also clear WS2812B accessories */
+    ws_clear(ws_buf_b1, WS_LED_COUNT); ws_dirty_b1 = true;
+    ws_clear(ws_buf_b2, WS_LED_COUNT); ws_dirty_b2 = true;
 }
+
 static void handle_relay_set(const uint8_t *pay, uint8_t paylen) {
     if (paylen < 2) return;
     Board_Relay_Set(pay[0], (pay[1] == 0x01));
@@ -299,12 +345,11 @@ void UART1_IRQHandler(void) {
     }
 }
 
-/* -------------------- RIT: 100 ms (LED + polling) -------------------- */
+/* -------------------- RIT: 70 ms (LED + polling + WS flush) ------------- */
 static volatile uint8_t  poll_rr_idx    = 0;   /* 0..(cfg_count-1) */
 static volatile bool     led_active_prev = false;
 
 static inline void commit_and_clear_poll_round(void) {
-    /* Commit last round (whatever we gathered), then clear accumulators */
     g_alive_mask         = alive_round_mask;
     g_triggered_mask     = triggered_round_mask & g_alive_mask; /* trigger only if alive */
     alive_round_mask     = 0;
@@ -327,10 +372,9 @@ void RIT_IRQHandler(void) {
     g_led_streaming_active = led_active_now;
 
     if (led_active_now) {
-        /* entering LED mode? remember we were interrupted */
         led_active_prev = true;
 
-        /* round-robin exactly ONE LED job per tick, with per-job rate limit */
+        /* round-robin ONE LED job per tick, with per-job rate limit */
         for (uint8_t k = 0; k < MAX_LED_JOBS; ++k) {
             uint8_t i = (uint8_t)((jobs_rr + k) % MAX_LED_JOBS);
             if (!g_jobs[i].active) continue;
@@ -341,38 +385,49 @@ void RIT_IRQHandler(void) {
                 break;  /* only one job per tick */
             }
         }
-        return;    /* no round-robin polling while LEDs stream */
+        /* Also flush WS strips */
+        ws_flush_if_dirty();
+        return;    /* no general polling while LEDs stream */
     }
 
-    /* LED mode ended: DO NOT commit/clear snapshot here (avoid zero-list blip).
-       Just restart poll sequence from the beginning (1..N). */
+    /* LED mode ended: resume poll from start (1..N); keep snapshot until next commit */
     if (led_active_prev) {
         led_active_prev = false;
-        poll_rr_idx = 0;         /* resume at connector #1 */
-        /* keep g_alive_mask/g_triggered_mask as-is until next round commit */
+        poll_rr_idx = 0;     /* resume at connector #1 */
     }
 
     /* Polling mode */
-    if (cfg_count == 0) return;  /* nothing to poll until Upload-Map */
+    if (cfg_count == 0) { ws_flush_if_dirty(); return; }
 
-    /* At the START of each new round (idx==0), commit previous round and clear accumulators */
     if (poll_rr_idx == 0) {
-        commit_and_clear_poll_round();
+        commit_and_clear_poll_round();   /* commit previous round, begin new */
     }
 
-    /* Strict 1..N order by cfg_conn[] contents */
+    /* Strict 1..N by cfg_conn[] */
     uint8_t con = cfg_conn[poll_rr_idx];
     slave_enqueue_poll(con);
 
-    /* Advance, wrap to 0 => next tick starts a new round and commits previous */
     poll_rr_idx++;
     if (poll_rr_idx >= cfg_count) poll_rr_idx = 0;
+
+    /* Flush WS strips */
+    ws_flush_if_dirty();
 }
 
 /* -------------------- Main -------------------- */
 int main(void) {
     SystemCoreClockUpdate();
     Board_Init();
+
+    /* --- WS2812B pins: P3.25 (B1), P3.26 (B2) as GPIO outputs --- */
+    Chip_IOCON_Init(LPC_IOCON);
+    Chip_GPIO_Init(LPC_GPIO);
+    Chip_IOCON_PinMuxSet(LPC_IOCON, 3, 25, IOCON_FUNC0 | IOCON_MODE_INACT);
+    Chip_IOCON_PinMuxSet(LPC_IOCON, 3, 26, IOCON_FUNC0 | IOCON_MODE_INACT);
+    Chip_GPIO_SetPinDIROutput(LPC_GPIO, 3, 25);
+    Chip_GPIO_SetPinDIROutput(LPC_GPIO, 3, 26);
+    ws_clear(ws_buf_b1, WS_LED_COUNT); ws_clear(ws_buf_b2, WS_LED_COUNT);
+    ws_dirty_b1 = ws_dirty_b2 = true;   /* push initial clear */
 
     /* UART0 (APP link): 19,200 8N1 */
     Chip_UART_Init(UART_APP);
@@ -397,7 +452,7 @@ int main(void) {
     NVIC_SetPriority(IRQ_SLAVE, 2);
     NVIC_EnableIRQ(IRQ_SLAVE);
 
-    /* RIT: 100 ms period does LED publishing AND polling */
+    /* RIT: 70 ms period does LED publishing, polling, WS flush */
     Chip_RIT_Init(LPC_RITIMER);
     Chip_RIT_SetTimerInterval(LPC_RITIMER, RIT_TICK_MS);
     NVIC_ClearPendingIRQ(RITIMER_IRQn);

@@ -1,4 +1,5 @@
-example/src/uart_rb.o example/src/uart_rb.d: ../example/src/uart_rb.c \
+example/src/ws2812b.o example/src/ws2812b.d: ../example/src/ws2812b.c \
+ ../example/src/ws2812b.h \
  C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/chip.h \
  C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/lpc_types.h \
  C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/sys_config.h \
@@ -38,8 +39,8 @@ example/src/uart_rb.o example/src/uart_rb.d: ../example/src/uart_rb.c \
  C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/error.h \
  C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_board_nxp_lpcxpresso_1769\inc/board.h \
  C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_board_nxp_lpcxpresso_1769\inc/board_api.h \
- C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/lpc_types.h \
- ../example/src/ws2812b.h
+ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/lpc_types.h
+../example/src/ws2812b.h:
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/chip.h:
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/lpc_types.h:
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/sys_config.h:
@@ -80,4 +81,3 @@ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/e
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_board_nxp_lpcxpresso_1769\inc/board.h:
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_board_nxp_lpcxpresso_1769\inc/board_api.h:
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/lpc_types.h:
-../example/src/ws2812b.h:

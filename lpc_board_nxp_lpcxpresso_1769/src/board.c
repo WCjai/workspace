@@ -38,6 +38,13 @@ void Board_Relays_Init(void) {
     }
 }
 
+void Board_ws2812_Init(void) {
+    Chip_IOCON_Init(LPC_IOCON);
+    Chip_GPIO_Init(LPC_GPIO);
+    Chip_GPIO_Init(LPC_GPIO3);
+    LPC_SYSCTL->PCONP |= (1 << 15);
+}
+
 void Board_Relay_Set(uint8_t relay, bool on) {
     if (relay >= 1 && relay <= 6) {
         const relay_pin_t *rp = &kRelayPins[relay - 1];

@@ -1,0 +1,4 @@
+../example/src/ws2812b.c:13:20:send_zero	4	static
+../example/src/ws2812b.c:34:20:send_one	4	static
+../example/src/ws2812b.c:56:6:turnOnRed	16	static
+../example/src/ws2812b.c:69:6:WS2812B_write	32	static
