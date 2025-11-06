@@ -237,7 +237,7 @@ Example: 27 04 85 01 09 00 16
 | App→RX | Poll/No‑op                  | 0x00 | `85 01 00` + `00`                              | RX replies heartbeat |
 | App→RX | Reset Push‑Button Flag      | 0x09 | `85 01 09 00`                                   | Heartbeat FLAGS ← `0x00` ie reset sw2 state from 02 to 00|
 | RX→App | Heartbeat                   | 0x0A | `00 01 0A FLAGS N S1…SN 00 00`                 | `Si: 00/05/07`; FLAGS `00`/`02` |
-| Slave→RX | Status reply              | —    | `27 27 03 0A <ADDR> <STATE> 16`                | `<STATE: 01|03>` both imply alive if 01 it is alive if 03 limit sw is triggered |
+| Slave→RX | Status reply              | —    | `27 27 03 0A <ADDR> <STATE> 16`                | if state is 01 it is alive if 03 limit sw is triggered |
 
 *(For full frames, wrap BODY with `27 <LEN> … 16`. For Upload‑Map, the App’s LEN is ignored by RX.)*
 
