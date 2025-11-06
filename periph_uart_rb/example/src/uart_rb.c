@@ -42,11 +42,6 @@
 /* ------------------------------ RX identity -------------------------------- */
 #define RX_ID 0x01
 
-/* --------------------------- Slave frame “lengths” -------------------------- */
-/* These are the “mystery” second byte values observed in your traces. */
-#define SLAVE_LEN_ON    0x97
-#define SLAVE_LEN_OFF   0x97
-#define SLAVE_LEN_POLL  0x97
 
 /* ----------------------------- Protocol bytes ------------------------------- */
 enum {
@@ -55,23 +50,25 @@ enum {
 };
 enum {
     GRP_APP_TO_RX = 0x85,
-    GRP_RX_TO_APP = 0x00
+    GRP_RX_TO_APP = 0x00,
+	GRP_RX_TO_SLV = 0x97,
+	GRP_SLV_TO_RX = 0x27
 };
 enum {
     SC_POLL       = 0x00,
     SC_LED_CTRL   = 0x02,
     SC_UPLOAD_MAP = 0x04,
     SC_LED_RESET  = 0x3A,
-    SC_RELAY_SET  = 0x06
+    SC_RELAY_SET  = 0x06,
+	SC_STATUS = 0x0A,
+	SC_BTNFLAG_RESET = 0x09,
+	SC_SLAVE = 0x85
 };
-enum {
-    SC_STATUS = 0x0A
-};
+
 
 static volatile uint8_t g_status_ext = 0x00;   /* 0x00 normally, 0x02 when button pressed */
 
-/* App command to clear button flag */
-enum { SC_BTNFLAG_RESET = 0x09 };
+
 
 /* ------------------------------- Limits/sizes ------------------------------- */
 #define MAX_CFG      31
@@ -129,17 +126,17 @@ static inline bool u1q_pop_main(U1Frame *out) {
 /* ------------------------ Helpers: enqueue slave frames --------------------- */
 static inline void slave_enqueue_led_on(uint8_t con, uint8_t led) {
     /* 27, 97, 05, 85, con, 02, 01, led, 16 */
-    uint8_t f[9] = { SOF, SLAVE_LEN_ON, 0x05, GRP_APP_TO_RX, con, 0x02, 0x01, led, END_BYTE };
+    uint8_t f[9] = { SOF, GRP_RX_TO_SLV, 0x05, SC_SLAVE, con, 0x02, 0x01, led, END_BYTE };
     (void)u1q_push_isr(f, sizeof f);
 }
 static inline void slave_enqueue_led_off_broadcast(void) {
     /* 27, 97, 04, 85, FF, 03, 00, 16   (0x03 seen in your trace) */
-    uint8_t f[8] = { SOF, SLAVE_LEN_OFF, 0x04, GRP_APP_TO_RX, 0xFF, 0x03, 0x00, END_BYTE };
+    uint8_t f[8] = { SOF, GRP_RX_TO_SLV, 0x04, SC_SLAVE, 0xFF, 0x03, 0x00, END_BYTE };
     (void)u1q_push_isr(f, sizeof f);
 }
 static inline void slave_enqueue_poll(uint8_t con) {
     /* 27, 97, 05, 85, con, 00, 00, 00, 16 */
-    uint8_t f[9] = { SOF, SLAVE_LEN_POLL, 0x05, GRP_APP_TO_RX, con, 0x00, 0x00, 0x00, END_BYTE };
+    uint8_t f[9] = { SOF, GRP_RX_TO_SLV, 0x05, SC_SLAVE, con, 0x00, 0x00, 0x00, END_BYTE };
     (void)u1q_push_isr(f, sizeof f);
 }
 
@@ -181,7 +178,7 @@ static uint8_t build_status_frame(uint8_t *dst, uint8_t cap) {
        If not, this still works with your committed masks. */
     const uint32_t view_alive = (g_alive_mask | round_alive_mask);
     const uint32_t view_trig  = ( (g_triggered_mask | round_triggered_mask) & view_alive );
-    
+
     uint8_t *p = dst;
     *p++ = SOF;
     *p++ = LEN;
@@ -210,44 +207,61 @@ static inline void send_status(void) {
 }
 
 /* ------------------------------ WS2812B strips ------------------------------ */
+/* ------------------------------ WS2812B strips (P3.25 + mirror on P3.26) --- */
+/* BIN=1 => control P3.25 (B1). P3.26 (B2) mirrors B1 automatically.
+   BIN>=2 reserved for future independent behavior (placeholder below). */
+
 #define WS_LED_COUNT 96
 
-static RGB_t   ws_buf_b1[WS_LED_COUNT];
-static RGB_t   ws_buf_b2[WS_LED_COUNT];
-static WS2812B ws_b1 = { .leds = ws_buf_b1, .num_leds = WS_LED_COUNT };
-static WS2812B ws_b2 = { .leds = ws_buf_b2, .num_leds = WS_LED_COUNT };
+static RGB_t   ws_buf[WS_LED_COUNT];                     /* single shared buffer */
+static WS2812B ws_b1 = { .leds = ws_buf, .num_leds = WS_LED_COUNT }; /* P3.25 */
+static WS2812B ws_b2 = { .leds = ws_buf, .num_leds = WS_LED_COUNT }; /* P3.26 mirror */
 
-static volatile bool ws_dirty_b1 = false;
-static volatile bool ws_dirty_b2 = false;
+static volatile bool ws_dirty = false;
 
-static inline void ws_clear(RGB_t *buf, uint16_t n) {
-    memset(buf, 0, n * sizeof(RGB_t));
+static inline void ws_clear_all(void) {
+    memset(ws_buf, 0, sizeof(ws_buf));
+    ws_dirty = true;
 }
-static inline void ws_set_red(RGB_t *buf, uint16_t n, uint16_t led1) {
-    if (led1 == 0 || led1 > n) return;
+
+static inline void ws_set_red_1indexed(uint16_t led1) {
+    if (led1 == 0 || led1 > WS_LED_COUNT) return;
     const uint16_t idx = (uint16_t)(led1 - 1);
-    buf[idx].r = 255; buf[idx].g = 0; buf[idx].b = 0; /* swap if your driver needs GRB */
-}
-static inline void ws_flush_if_dirty(void) {
-    if (ws_dirty_b1) { WS2812B_write(&ws_b1); ws_dirty_b1 = false; }
-    if (ws_dirty_b2) { WS2812B_write(&ws_b2); ws_dirty_b2 = false; }
+    ws_buf[idx].r = 255; ws_buf[idx].g = 0; ws_buf[idx].b = 0; /* adjust to GRB in driver if needed */
+    ws_dirty = true;
 }
 
-/* Try to parse WS accessory command inside SC_LED_CTRL payload:
+static inline void ws_flush_if_dirty(void) {
+    if (!ws_dirty) return;
+    /* Same buffer is pushed out on BOTH pins, so P3.26 mirrors P3.25 */
+    WS2812B_write(&ws_b1);   /* data out on P3.25 */
+    WS2812B_write(&ws_b2);   /* same data out on P3.26 (mirror) */
+    ws_dirty = false;
+}
+
+/* Try to parse WS accessory command inside SC_LED_CTRL payload.
    Expected payload (pal >= 9):
        00 00 00 02 <BIN> <LED#> 00 00 00
-   BIN: 1 => B1 (P3.25), 2 => B2 (P3.26)
-*/
+   BIN: 1 => drives P3.25; P3.26 mirrors automatically
+   BIN>=2: reserved (placeholder; consumed but no action) */
 static bool try_handle_ws_accessory(const uint8_t *pay, uint8_t pal) {
     if (pal < 9) return false;
     if (pay[0] != 0x00 || pay[1] != 0x00 || pay[2] != 0x00) return false;
-    if (pay[3] != 0x02) return false;               /* accessory command marker */
+    if (pay[3] != 0x02) return false;
+
     const uint8_t bin = pay[4];
     const uint8_t led = pay[5];
 
-    if (bin == 1) { ws_set_red(ws_buf_b1, WS_LED_COUNT, led); ws_dirty_b1 = true; return true; }
-    if (bin == 2) { ws_set_red(ws_buf_b2, WS_LED_COUNT, led); ws_dirty_b2 = true; return true; }
-    return false;
+    if (bin == 1) {
+        /* Act on BIN=1: set that LED to RED on P3.25; P3.26 mirrors */
+        ws_set_red_1indexed(led);
+        return true; /* consumed */
+    }
+
+    /* Placeholder for future: BIN>=2 reserved for independent control.
+       For now we just consume the frame and do nothing so it doesn't
+       fall back to legacy LED job handling. */
+    return true;
 }
 
 /* ------------------------------- App handlers ------------------------------- */
@@ -304,9 +318,8 @@ static void handle_led_reset(const uint8_t *pay, uint8_t paylen) {
     for (uint8_t i = 0; i < MAX_LED_JOBS; ++i) g_jobs[i].active = 0;
     g_off_broadcast_pending = 1;
 
-    /* Also clear WS accessories */
-    ws_clear(ws_buf_b1, WS_LED_COUNT); ws_dirty_b1 = true;
-    ws_clear(ws_buf_b2, WS_LED_COUNT); ws_dirty_b2 = true;
+    /* Clear WS (both pins mirror the same buffer) */
+    ws_clear_all();
 }
 
 static void handle_relay_set(const uint8_t *pay, uint8_t paylen) {
@@ -556,8 +569,7 @@ int main(void) {
     Chip_GPIO_SetPinDIROutput(LPC_GPIO, 3, 26);
 
     /* clear strips once at boot (will flush on first RIT) */
-    ws_clear(ws_buf_b1, WS_LED_COUNT); ws_dirty_b1 = true;
-    ws_clear(ws_buf_b2, WS_LED_COUNT); ws_dirty_b2 = true;
+
 
     /* UART0 (App link): 19,200 8N1 */
     Chip_UART_Init(UART_APP);

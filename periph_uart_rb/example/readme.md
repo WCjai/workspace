@@ -141,14 +141,14 @@ STATE: 0x01 = ON (kept alive periodically), 0x00 = OFF (single broadcast OFF)
 - `LED_ON`: `27 97 05 85 <CONN> 02 01 <LED> 16`  
 - `OFF (broadcast)`: `27 97 04 85 FF 03 00 16`
 
-#### (B) **Addressable WS2812B (B1/B2 on P3.25/P3.26)**
+#### (B) **Addressable WS2812B (B1 on P3.25/P3.26)**
 
 App frame examples you provided:
 ```
 27 0C 85 01 02 00 00 00 02 <BUS> <LED#> 00 00 00 16
                    ^            ^BUS  ^LED#
 ```
-- `BUS=0x01` → B1 (P3.25), `BUS=0x02` → B2 (P3.26)  
+- `BUS=0x01` → B1 (P3.25) (P3.26) `BUS=0x0N` → for other   
 - `LED#` = 1‑based LED index on that strip  
 - RX updates its **WS2812B framebuffer** and schedules a flush in the display service window.  
 - The simple LED **OFF broadcast** also clears addressable LEDs for consistency.
@@ -174,6 +174,9 @@ Effect : Stop all LED keep‑alive jobs, issue one broadcast OFF.
 PAYLOAD: RELAY  STATE
          1B     1B
 STATE: 0x01=ON, else OFF
+
+Turn on R1 27 05 85 01 06 01 01 16
+Turn off R2 27 05 85 01 06 02 00 16
 ```
 
 ---
@@ -226,15 +229,16 @@ Example: 27 04 85 01 09 00 16
 
 | Direction | Purpose                   | SC   | Typical BODY (hex)                             | Notes |
 |---|---|---|---|---|
-| App→RX | Upload‑Map                  | 0x04 | `85 01 04 N (c1 01) … (cN 01)`                | LEN may be wrong; RX reads to END and parses. |
+| App→RX | Upload‑Map                  | 0x04 | `85 01 04 N (c1 01) … (cN 01)`                | reads N and starts roundrobin on UART1 for con alive state. |
 | App→RX | LED Control (simple)        | 0x02 | `85 01 02 STATE CONN LED`                      | `STATE: 01=ON, 00=OFF` |
-| App→RX | LED Control (WS2812B)       | 0x02 | `85 01 02 00 00 00 02 BUS LED# 00 00 00`      | `BUS: 1=B1, 2=B2`; paddings ignored |
-| App→RX | LED Reset (all OFF)         | 0x3A | `85 01 3A` + `00`                              | Stops jobs, broadcast OFF |
+| App→RX | LED Control (WS2812B)       | 0x02 | `85 01 02 00 00 00 02 BUS LED# 00 00 00`      | `BUS: 1=B1 for GPIO led`; paddings ignored |
+| App→RX | LED Reset (all OFF)         | 0x3A | `85 01 3A` + `00`                              | Stops jobs, broadcast OFF led to all |
 | App→RX | Relay Set                   | 0x06 | `85 01 06 RELAY STATE`                         | `STATE: 01=ON, else OFF` |
 | App→RX | Poll/No‑op                  | 0x00 | `85 01 00` + `00`                              | RX replies heartbeat |
-| App→RX | Reset Push‑Button Flag      | 0x09 | `85 01 09 00`                                   | Heartbeat FLAGS ← `0x00` |
-| RX→App | Heartbeat                   | 0x0A | `00 01 0A FLAGS N S1…SN 00 00`                 | `Si: 00/05/07`; FLAGS `00`/`02` |
-| Slave→RX | Status reply              | —    | `27 27 03 0A <ADDR> <STATE> 16`                | `<STATE: 01|03>` both imply alive |
+| App→RX | Reset Push‑Button Flag      | 0x09 | `85 01 09 00`                                   | Heartbeat FLAGS ← `0x00` ie reset sw2 state from 02 to 00|
+| RX→App | Heartbeat                   | 0x0A | `00 01 0A FLAGS N S1…SN 00 00`                 | `Si: 00/05/07`; FLAGS `00`/`02` Si 00 dead con, 05 alive, 07 limit triggered|
+| Slave→RX | Status reply              | —    | `27 27 03 0A <ADDR> <STATE> 16`                | if state is 01 it is alive if 03 limit sw is triggered |
+| RX→Slave | Get Status                | —    | `27 97 05 85 <con> 00 00 00 16`                | con = 1,2,3... n and send this hex in UART1 and wait for reply |
 
 *(For full frames, wrap BODY with `27 <LEN> … 16`. For Upload‑Map, the App’s LEN is ignored by RX.)*
 

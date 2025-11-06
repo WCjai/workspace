@@ -6,7 +6,7 @@
  * Generated linker script file for LPC1768
  * Created from linkscript.ldt by FMCreateLinkLibraries
  * Using Freemarker v2.3.30
- * MCUXpresso IDE v25.6 [Build 136] [2025-06-27] on 06-Nov-2025, 3:11:35 pm
+ * MCUXpresso IDE v25.6 [Build 136] [2025-06-27] on 06-Nov-2025, 6:32:39 pm
  */
 
 INCLUDE "periph_uart_rb_Debug_library.ld"
