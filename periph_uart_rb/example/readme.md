@@ -1,221 +1,301 @@
-# RX Device Replica — Protocol & Code Documentation
+# RX↔APP Protocol — Revised Spec (Upload‑Map LEN‑tolerant)
 
-This document explains the structure and behavior of the RX-device replica implemented in **`main.c`** (cleaned-up version), including protocol details, buffers, the RX frame parser, and each function’s role.
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Wire Protocol](#wire-protocol)
-  - [Frame Layout](#frame-layout)
-  - [App → RX Commands](#app--rx-commands)
-  - [RX → App Replies](#rx--app-replies)
-- [Buffers, Limits, and Sizing](#buffers-limits-and-sizing)
-- [Source Layout](#source-layout)
-- [Runtime Flow](#runtime-flow)
-- [Function Reference](#function-reference)
-- [Typical Sequences](#typical-sequences)
-- [Error Handling & Safety](#error-handling--safety)
-- [Porting & Build Notes](#porting--build-notes)
-- [Extending the Stub](#extending-the-stub)
+This document describes the byte-level protocol between the **App ⇄ RX** device and the **RX ⇄ Slave** bus, matching the current firmware behavior—including tolerant parsing for the **Upload‑Map** command where the App transmits an **incorrect LEN**.
 
 ---
 
-## Overview
+## 1) Transport & Framing
 
-The program emulates an **RX device** that talks to an **App** over **UART0** and (optionally) to **slave LED boards** over **UART1**.
+**Physical links**
+- **UART0 (APP⇄RX)**: 19 200 baud, 8‑N‑1  
+- **UART1 (RX⇄Slaves)**: 9 600 baud, 8‑N‑1
 
-- **App → RX (`GROUP = 0x85`)**: poll/heartbeat, upload-map, LED control, LED reset, relay control.  
-- **RX → App (`GROUP = 0x00`)**: status frames (variable-length, reflecting the current configured connectors).
+**Frame format (both directions)**
+```
++------+-----+--------- ... ---------+------+
+| SOF  | LEN |      BODY (LEN bytes) | END  |
++------+-----+------------------------+------+
+ 0x27   1 B          LEN bytes         0x16
+```
+- **SOF**: `0x27`  
+- **LEN**: Number of bytes from the first BODY byte through the last BODY byte (excludes SOF/END)  
+- **END**: `0x16`  
+- **Checksum**: none
 
-Internally the RX replica:
-
-- Stores the **configured connector list** (`cfg_conn`, length `cfg_count`) upon **Upload-Map**.  
-- Replies to **Poll** with a **Status** frame that includes one **per-connector presence byte** (`0x05` = present, `0x00` = absent) for each configured connector. Presence is currently driven by a static `alive_list`.  
-- Applies **LED control** via placeholders (`led_on/off`), ready to be wired to UART1 later.  
-- Applies **Relay set** via actual GPIO writes (implemented in `board.c`).
+**BODY layout (APP⇄RX)**
+```
++-------+------+----+-----------...
+| GROUP |  ID  | SC |  PAYLOAD
++-------+------+----+-----------...
+```
+- `GROUP` = `0x85` (App→RX), `0x00` (RX→App)  
+- `ID`    = `0x01` (your RX device id)  
+- `SC`    = “sub‑command” selector (see §4)
 
 ---
 
-## Wire Protocol
+## 2) Heartbeat (RX→App)
 
-### Frame Layout
+Sent by RX **after every valid App→RX command** and may also be sent periodically by the application layer.
 
-All frames use this layout (both directions):
+**Semantics**
+- Reports *presence* and *limit* state for the **configured connectors** (from Upload‑Map).
+- Includes a **global FLAGS byte** (push‑button status).
 
+**Format**
 ```
-[0x27] [LEN] [GROUP] [RX_ID] [SUBCMD] [PAYLOAD ...] [0x16]
+SOF LEN  GROUP ID  SC   FLAGS  N    S1  S2 ... SN   00 00  END
+27  (N+7) 00   01  0A   FF?    N   Si … Si        (reserved)
 ```
+- `GROUP=0x00`, `ID=0x01`, `SC=0x0A`  
+- `FLAGS` (1 B): **global status**
+  - `0x00` = normal
+  - `0x02` = **push‑button asserted** (see §5)
+- `N` (1 B): number of connectors (equals “enabled count” in Upload‑Map)  
+- `Si` (N B): **per‑connector status** in the **order** provided by Upload‑Map  
+  - `0x00` = not alive (no reply in last committed round)  
+  - `0x05` = alive (limit **not** triggered)  
+  - `0x07` = alive **and** limit triggered
 
-- `0x27` = start (SOF)  
-- `LEN`   = number of bytes from `[GROUP]` through the **last payload byte** (excludes SOF, LEN, END)  
-- `GROUP` = `0x85` (App→RX) or `0x00` (RX→App)  
-- `RX_ID` = which RX unit (this code uses `0x01`)  
-- `SUBCMD` = command code  
-- `0x16` = end (END_BYTE)
+> Heartbeat **doesn’t clear snapshots** when LED streaming starts/stops. Snapshots are committed only at poll‑round boundaries (see §6). While streaming, the targeted connector’s status can still update immediately from LED‑ON replies.
 
-### App → RX Commands
-
-| Subcmd | Hex  | Meaning                      | Payload (App→RX)                         | Notes |
-|:------:|:----:|------------------------------|------------------------------------------|------|
-| Poll   | `00` | Heartbeat / status request   | `00`                                     | RX replies with Status |
-| LED    | `02` | LED control                  | `[state] [connector] [led#] [00 00 00]`  | Only first 3 are used by stub |
-| Map    | `04` | Upload connector map         | `N [conn1 state1] … [connN stateN]`      | Keep `state==0x01` only |
-| Reset  | `3A` | LED reset / clear LEDs       | `00`                                     | Clears LEDs in real device (no-op here) |
-| Relay  | `06` | Relay set                    | `[relay#] [0/1]`                         | Drives GPIO relays |
-
-**Upload-Map length rule:**  
-`LEN = 4 + 2*N` (for `N` connector pairs).
-
-### RX → App Replies
-
-**Status (`SC_STATUS = 0x0A`)**
-
+**Example (N=3, 1&2 alive, 3 dead, no push‑button):**
 ```
-27 (N+7) 00 RX_ID 0A  flags  N  S1 S2 ... SN  00 00  16
+27 0A 00 01 0A 00 03 05 07 00 00 00 16
+          ^FLAGS=00  ^N=3  S1=05 S2=07 S3=00
 ```
 
-- `N` = number of **configured** connectors (post Upload-Map), capped by `MAX_CFG`.
-- `Si` = per-connector presence (`0x05` present / `0x00` absent).  
-- Length: `LEN = N + 7`, on-wire total: `LEN + 3 = N + 10`.
+---
+
+## 3) Slave Status (Slave→RX on UART1)
+
+Slaves reply to poll and to LED‑ON with:
+```
+27 27 03 0A <ADDR> <STATE> 16
+```
+- `<ADDR>`: connector address (1..31)  
+- `<STATE>`:
+  - `0x01` = idle / limit **not** triggered (but still “alive”)  
+  - `0x03` = limit **triggered** (alive)
+
+**RX update logic**
+- Set `alive` for `<ADDR>` when `<STATE> != 0x00`  
+- Set/clear `triggered` for `<ADDR>` based on `<STATE>`  
+- If **LED streaming is active**, apply these updates **immediately** to the committed snapshot for that connector.
 
 ---
 
-## Buffers, Limits, and Sizing
+## 4) App→RX Commands (SC codes)
 
-```c
-#define MAX_CFG         31                 // hardware max
-#define RX_LEN_MAX      (4 + 2*MAX_CFG)    // largest incoming LEN (Upload-Map)
-#define TX_FRAME_MAX    (MAX_CFG + 10)     // largest outgoing status frame on wire
+### 4.1 `SC=0x04` — Upload‑Map (configure polling set & order)
+
+Select which connectors (1..31) are in service and define their **poll/heartbeat order**.
+
+**Conceptual (correct) payload**
+```
+PAYLOAD:  N  (CONN1  STATE1) (CONN2 STATE2) ... (CONNN STATEN)
+          1B   1B     1B       1B     1B           1B
+STATEi: 0x01 = enabled; any other value = disabled
+LEN should be 4 + 2*N
 ```
 
-- **Why `RX_LEN_MAX`**: Upload-Map is largest incoming (`LEN = 4 + 2*N`), worst `N=31` → `LEN=66`.  
-- **Why `TX_FRAME_MAX`**: Status is largest outgoing (on-wire bytes = `N + 10`, worst `N=31` → `41`).
+**Actual behavior (App bug tolerated):**  
+For `SC=0x04` **only**, RX **ignores LEN** and reads until `END=0x16`, then parses:
+- `N = payload[0]`
+- read `N` pairs `(CONN, STATE)`
+- **Enable** any `CONN` whose `STATE==0x01`
+- **Order** in RX = the order the pairs appear
 
-The RX frame parser rejects frames with `LEN == 0` or `LEN > RX_LEN_MAX` and resets on overflow.
+**Examples from App (as‑sent)**
 
----
+- N=3:
+```
+27 0A 85 01 04 03 01 01 02 01 03 01 16
+      
+```
+Parsed → enabled: 1,2,3; order `[1,2,3]`.
 
-## Source Layout
-
-- **`board_sysinit.c`** — Pin mux and clocking (UART0 P0.2/P0.3, UART1 P2.0/P2.1, relay GPIOs).  
-- **`board.c`** — GPIO relay setup and control (`Board_Relays_Init`, `Board_Relay_Set`).  
-- **`main.c`** — Protocol, parser, command handlers, and UART runtime loop.
-
----
-
-## Runtime Flow
-
-1. **UART0 ISR** ingests bytes from the App and assembles frames with a tiny state machine.  
-2. On a full, valid frame, **`dispatch_body()`** routes by `SUBCMD`.  
-3. The stub updates state (`cfg_conn/cfg_count`), toggles relays/LEDs, and queues **status** frames as needed.  
-4. The **main loop** sends any queued reply via `Chip_UART_SendBlocking` and returns to idle (`__WFI`).
-
----
-
-## Function Reference
-
-### Presence & LED helpers
-
-- **`bool is_alive(uint8_t conn)`**  
-  Returns whether the given connector is reported as present (`0x05`) using the static `k_alive_list`.
-
-- **`void led_on(uint8_t con, uint8_t led)` / `void led_off(uint8_t con, uint8_t led)`**  
-  Placeholders for slave LED bus control (wire to UART1 later).
-
-### Outgoing status
-
-- **`uint8_t build_status_frame(uint8_t *dst, uint8_t cap)`**  
-  Builds a full **Status** frame into `dst`. Returns on-wire byte count (including SOF/LEN/END), or `0` if it won’t fit.
-
-- **`void send_status(void)`**  
-  Builds Status into the global TX buffer and marks it for sending in the main loop.
-
-### Command handlers
-
-- **`void handle_upload_map(const uint8_t *pay, uint8_t paylen)`**  
-  Parses Upload-Map: `N` followed by `N` pairs `[connector, state]`.  
-  Keeps only entries with `state == 0x01`, up to `MAX_CFG`, preserving order.  
-  Sends Status immediately after updating `cfg_conn/cfg_count`.
-
-- **`void handle_led_ctrl(const uint8_t *pay, uint8_t paylen)`**  
-  Parses LED control: `[state][connector][led]` and calls the LED placeholder.
-
-- **`void handle_led_reset(const uint8_t *pay, uint8_t paylen)`**  
-  Placeholder for global LED clear (`0x3A`). No-op in stub.
-
-- **`void handle_relay_set(const uint8_t *pay, uint8_t paylen)`**  
-  Parses `[relay#][0/1]` and calls `Board_Relay_Set` (drives GPIO).
-
-### Parser & ISR
-
-- **`void rx_ingest(uint8_t b)`**  
-  Byte-by-byte parser FSM with four states: `WAIT_SOF → WAIT_LEN → COLLECT_BODY → WAIT_END`.  
-  Resets on overflow or invalid length.
-
-- **`void dispatch_body(const uint8_t *p, uint8_t len)`**  
-  Validates `GROUP`/`RX_ID`, switches on `SUBCMD`, and calls the appropriate handler.  
-  For `SC_POLL`, sends a Status.
-
-- **`void HANDLER_APP(void)`**  
-  UART0 ISR: drains RX FIFO and feeds `rx_ingest`.
-
-### Main
-
-- **`int main(void)`**  
-  System/board init, UART0/UART1 setup, IRQ enable, and the TX-queue flush loop.
+- N=5:
+```
+27 0E 85 01 04 05 01 01 02 01 03 01 04 01 05 01 16
+      
+```
+Parsed → enabled: 1,2,3,4,5; order `[1,2,3,4,5]`.
 
 ---
 
-## Typical Sequences
+### 4.2 `SC=0x02` — LED Control
 
-### First boot (no map configured)
-- **App → RX**: Poll — `27 04 85 01 00 00 16`  
-- **RX → App**: Status with `N=0` — `27 07 00 01 0A 00 00 00 00 16`
+Two payload forms under the same SC:
 
-### Upload map (e.g., connectors 1..3 enabled)
-- **App → RX**: Upload-Map `SC=0x04` with `N=3`, pairs `[1,1][2,1][3,1]`  
-- **RX**: Stores `cfg_conn={1,2,3}`, `cfg_count=3`; **immediately** sends Status with `N=3` and presence bytes from `is_alive()`.
+#### (A) **Simple LED (slave board)**
+```
+PAYLOAD:  STATE  CONN  LED
+          1B     1B    1B
+STATE: 0x01 = ON (kept alive periodically), 0x00 = OFF (single broadcast OFF)
+```
+- `STATE=0x01` → start/maintain a **LED keep‑alive job** (RIT will periodically send `LED_ON` to `<CONN>/<LED>`).  
+- `STATE=0x00` → stop that job, then **one** broadcast OFF on UART1.
 
-### Poll after map
-- **App → RX**: Poll  
-- **RX → App**: Status (`N=3`, `S1..S3`).
+**On‑wire to slave (UART1)**
+- `LED_ON`: `27 97 05 85 <CONN> 02 01 <LED> 16`  
+- `OFF (broadcast)`: `27 97 04 85 FF 03 00 16`
 
-### LED control
-- **App → RX**: `SC=0x02`, payload `[state][conn][led]`  
-- **RX**: Calls LED placeholder (`led_on/off`).
+#### (B) **Addressable WS2812B (B1/B2 on P3.25/P3.26)**
 
-### Relay control
-- **App → RX**: `SC=0x06`, payload `[relay#][0/1]`  
-- **RX**: `Board_Relay_Set()` toggles the relay GPIO.
+App frame examples you provided:
+```
+27 0C 85 01 02 00 00 00 02 <BUS> <LED#> 00 00 00 16
+                   ^            ^BUS  ^LED#
+```
+- `BUS=0x01` → B1 (P3.25), `BUS=0x02` → B2 (P3.26)  
+- `LED#` = 1‑based LED index on that strip  
+- RX updates its **WS2812B framebuffer** and schedules a flush in the display service window.  
+- The simple LED **OFF broadcast** also clears addressable LEDs for consistency.
 
----
-
-## Error Handling & Safety
-
-- **Length validation**: Frames with `LEN==0` or `LEN>RX_LEN_MAX` are discarded early.  
-- **Overflow guard**: If the body exceeds buffer capacity, the parser resets.  
-- **Connector cap**: Only the first `MAX_CFG` enabled connectors are stored; extra pairs are ignored.  
-- **Buffer sizing**: Chosen to handle worst-case Upload-Map and Status frames without overflow.
-
----
-
-## Porting & Build Notes
-
-- **UART pins**: Ensure `board_sysinit.c` muxes UART0 and UART1 correctly (e.g., `P0.2/P0.3` for UART0; `P2.0/P2.1` for UART1 on FUNC2 — verify for your board).  
-- **Relays**: `board.c` maps relays to the given GPIOs and initializes them OFF.  
-- **Clocks**: `Board_SetupClocking()` configures a 100 MHz core (adjust if needed).
+*(The three padding `0x00` values are ignored.)*
 
 ---
 
-## Extending the Stub
-
-- **Real presence detection**: Replace `is_alive()` with actual checks (e.g., ping slaves via UART1) and maintain a dynamic presence table.  
-- **LED reset behavior**: Implement true LED clearing in `handle_led_reset()`.  
-- **Acks/Errors**: Add explicit ack/nack frames for robustness, if required.  
-- **CRC**: For stronger integrity, add a checksum/CRC and validate in the parser.
+### 4.3 `SC=0x3A` — LED Reset (all simple LEDs OFF)
+```
+PAYLOAD: —
+Effect : Stop all LED keep‑alive jobs, issue one broadcast OFF.
+```
+**App example (full frame):**
+```
+27 04 85 01 3A 00 16
+```
 
 ---
 
-*End of document.*
+### 4.4 `SC=0x06` — Relay Set
+```
+PAYLOAD: RELAY  STATE
+         1B     1B
+STATE: 0x01=ON, else OFF
+```
+
+---
+
+### 4.5 `SC=0x00` — Poll/No‑op
+- No payload needed; RX replies with a heartbeat (see §2).
+
+---
+
+### 4.6 `SC=0x09` — Reset Push‑Button Flag
+```
+PAYLOAD: 00
+Effect : Set Heartbeat FLAGS back to 0x00 (clears 0x02).
+Example: 27 04 85 01 09 00 16
+```
+(Upload‑Map also clears the push‑button flag—see §5.)
+
+---
+
+## 5) Push‑Button Flag (P2[3], interrupt‑driven)
+
+- **Hardware**: `P2[3]` with pull‑up; falling‑edge IRQ asserts a **latch**.  
+- **On press**: RX sets the **Heartbeat FLAGS** byte to `0x02` (persists across heartbeats).  
+- **To clear**: App sends **SC=0x09** (`27 04 85 01 09 00 16`) **or** Upload‑Map (SC=0x04); RX then sets FLAGS to `0x00`.
+
+**Heartbeat example with push‑button asserted (N=2, both alive & not triggered):**
+```
+27 09 00 01 0A 02 02 05 05 00 00 16
+          ^FLAGS=02 ^N=2  S1=05 S2=05
+```
+
+---
+
+## 6) Polling & Snapshot Commit (avoid “momentary 0”)
+
+- RX performs **round‑robin polling** of connectors in the **exact Upload‑Map order**: `c1, c2, …, cN`.  
+- A **round** = one pass through all `N`.  
+- At the **start of a new round**, RX **commits** the previous round’s accumulated replies into:
+  - `g_alive_mask`  (presence)
+  - `g_triggered_mask` (limit‑triggered; only meaningful where alive)
+- **LED streaming active** ⇒ **pause general polling**, but **do not clear** snapshots.  
+  - The targeted connector continues to update **immediately** via its LED‑ON replies.
+- When streaming ends (LED‑OFF), polling **resumes from the first configured connector**; snapshots remain until the next round commit.
+
+> If the App samples exactly between the last streamed reply and the next poll commit, it may momentarily read stale info for non‑streamed nodes. Firmware minimizes this; the App can re‑sample on `SC=0x3A/0x02` completion if needed.
+
+---
+
+## 7) Command Quick‑Reference
+
+| Direction | Purpose                   | SC   | Typical BODY (hex)                             | Notes |
+|---|---|---|---|---|
+| App→RX | Upload‑Map                  | 0x04 | `85 01 04 N (c1 01) … (cN 01)`                | LEN may be wrong; RX reads to END and parses. |
+| App→RX | LED Control (simple)        | 0x02 | `85 01 02 STATE CONN LED`                      | `STATE: 01=ON, 00=OFF` |
+| App→RX | LED Control (WS2812B)       | 0x02 | `85 01 02 00 00 00 02 BUS LED# 00 00 00`      | `BUS: 1=B1, 2=B2`; paddings ignored |
+| App→RX | LED Reset (all OFF)         | 0x3A | `85 01 3A` + `00`                              | Stops jobs, broadcast OFF |
+| App→RX | Relay Set                   | 0x06 | `85 01 06 RELAY STATE`                         | `STATE: 01=ON, else OFF` |
+| App→RX | Poll/No‑op                  | 0x00 | `85 01 00` + `00`                              | RX replies heartbeat |
+| App→RX | Reset Push‑Button Flag      | 0x09 | `85 01 09 00`                                   | Heartbeat FLAGS ← `0x00` |
+| RX→App | Heartbeat                   | 0x0A | `00 01 0A FLAGS N S1…SN 00 00`                 | `Si: 00/05/07`; FLAGS `00`/`02` |
+| Slave→RX | Status reply              | —    | `27 27 03 0A <ADDR> <STATE> 16`                | `<STATE: 01|03>` both imply alive |
+
+*(For full frames, wrap BODY with `27 <LEN> … 16`. For Upload‑Map, the App’s LEN is ignored by RX.)*
+
+---
+
+## 8) Worked Examples
+
+### A) Upload‑Map (App sends wrong LEN), then Heartbeat
+App (N=3: `1,2,3` enabled):
+```
+27 09 85 01 04 03 01 01 02 01 03 01 16
+```
+RX tolerates LEN → order `[1,2,3]`.
+
+Heartbeat (1 alive/no‑limit, 2 alive+limit, 3 dead; no push‑button):
+```
+27 0A 00 01 0A 00 03 05 07 00 00 00 16
+```
+
+### B) LED ON simple, then OFF
+LED ON (state=1) for `conn=2, led=3`:
+```
+27 06 85 01 02 01 02 03 16
+```
+RX streams; slave 2 replies; heartbeat shows S2 `05/07` accordingly.
+
+LED OFF (state=0) for `conn=2, led=3`:
+```
+27 06 85 01 02 00 02 03 16
+```
+RX stops job, one broadcast OFF; polling resumes at first connector, snapshots preserved until next commit.
+
+### C) WS2812B (B1, LED#3 on)
+```
+27 0C 85 01 02 00 00 00 02 01 03 00 00 00 16
+                   ^            ^BUS=1   ^LED#=3
+```
+
+### D) Push‑button assert & clear
+- Press P2[3] → Heartbeat `FLAGS=0x02`
+- Clear via App:
+```
+27 04 85 01 09 00 16
+```
+Next heartbeats: `FLAGS=0x00`.
+
+---
+
+## 9) Timing Summary (firmware behavior)
+
+- **RIT scheduler** (~70–100 ms tick)
+  - Sends keep‑alive `LED_ON` frames for active simple‑LED jobs (per‑job rate‑limited).
+  - **Any** LED job active ⇒ **pause** general polling; snapshots **not** cleared. Targeted connector continues to update.
+  - When LED jobs stop, polling **restarts from first connector**; previous snapshot persists until next round commit.
+- **Poll commit**: At the **start** of a new round, RX commits the previous round’s accumulations.
+
+---
+
+## 10) Robustness Notes
+
+- **Upload‑Map compatibility**: Only for `SC=0x04`, RX **ignores LEN** and parses to `END`. All other commands honor LEN.  
+- **No ghost clears**: LED OFF / LED Reset don’t zero the heartbeat.  
+- **Immediate updates while streaming**: Currently streamed connector’s status updates as soon as its reply is parsed.
+

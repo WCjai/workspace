@@ -26,6 +26,12 @@
        BIN=1 => B1(P3.25), BIN=2 => B2(P3.26). Lights RED.
    ============================================================================ */
 
+/* ------------------------------ sw 2 pin interrupt ------------------------------ */
+#define GPIO_BUTTON_PORT     2
+#define GPIO_BUTTON_PIN      3
+#define GPIO_IRQ_HANDLER     EINT3_IRQHandler
+#define GPIO_NVIC_NAME       EINT3_IRQn
+
 /* ------------------------------ UART selection ------------------------------ */
 #define UART_APP   LPC_UART0
 #define IRQ_APP    UART0_IRQn
@@ -171,32 +177,29 @@ static uint8_t build_status_frame(uint8_t *dst, uint8_t cap) {
     const uint8_t TOTAL = (uint8_t)(LEN + 3);
     if (TOTAL > cap) return 0;
 
-    /* Compose a stable "now" view that includes uncommitted round bits */
+    /* If you already compose “view_*” (OR in round masks), you can keep that here.
+       If not, this still works with your committed masks. */
     const uint32_t view_alive = (g_alive_mask | round_alive_mask);
     const uint32_t view_trig  = ( (g_triggered_mask | round_triggered_mask) & view_alive );
-
+    
     uint8_t *p = dst;
     *p++ = SOF;
     *p++ = LEN;
     *p++ = GRP_RX_TO_APP;
     *p++ = RX_ID;
     *p++ = SC_STATUS;
-    *p++ = 0x00;           /* flags/reserved */
-    *p++ = N;              /* number of connectors */
+    *p++ = g_status_ext;   /* <—— the byte right after 0x0A (SC_STATUS). 0x00 or 0x02 when button pressed */
+    *p++ = N;
 
     for (uint8_t i = 0; i < N; ++i) {
-        const uint8_t c = cfg_conn[i];
-        const uint32_t bit = CONN_BIT(c);
-
+        const uint8_t  c   = cfg_conn[i];
+        const uint32_t bit = (c >= 1 && c <= 31) ? (1u << (c - 1)) : 0;
         uint8_t Si = 0x00;
-        if (view_alive & bit) {
-            Si = (view_trig & bit) ? 0x07 : 0x05;  /* 07=alive+limit, 05=alive */
-        }
+        if (view_alive & bit) Si = (view_trig & bit) ? 0x07 : 0x05;
         *p++ = Si;
     }
-
-    *p++ = 0x00;           /* reserved */
-    *p++ = 0x00;           /* reserved */
+    *p++ = 0x00;   /* reserved */
+    *p++ = 0x00;   /* reserved */
     *p++ = END_BYTE;
     return TOTAL;
 }
@@ -259,6 +262,7 @@ static void handle_upload_map(const uint8_t *pay, uint8_t paylen) {
         const uint8_t s = pay[1 + 2*i + 1];
         if (s == 0x01) cfg_conn[cfg_count++] = c;
     }
+    g_status_ext = 0x00;
 }
 
 static void handle_led_ctrl(const uint8_t *pay, uint8_t paylen) {
@@ -310,6 +314,12 @@ static void handle_relay_set(const uint8_t *pay, uint8_t paylen) {
     Board_Relay_Set(pay[0], (pay[1] == 0x01));
 }
 
+static void handle_btnflag_reset(const uint8_t *pay, uint8_t pal) {
+    /* Your frame is 27 04 85 01 09 00 16 → payload is one byte 0x00 */
+    (void)pay; (void)pal;
+    g_status_ext = 0x00;     /* clear back to 0 */
+}
+
 /* ----------------------------- UART0 RX (App->RX) --------------------------- */
 typedef enum { RXF_WAIT_SOF=0, RXF_WAIT_LEN, RXF_COLLECT_BODY, RXF_WAIT_END } rx_fsm_t;
 
@@ -334,6 +344,7 @@ static void dispatch_app_frame(const uint8_t *p, uint8_t len) {
         case SC_LED_CTRL:    handle_led_ctrl(pay, pal);       break;
         case SC_LED_RESET:   handle_led_reset(pay, pal);      break;
         case SC_RELAY_SET:   handle_relay_set(pay, pal);      break;
+        case SC_BTNFLAG_RESET: handle_btnflag_reset(pay, pal);      break;
         default:                                           break;
     }
     /* Reply heartbeat after any valid command */
@@ -511,10 +522,30 @@ void RIT_IRQHandler(void) {
     ws_flush_if_dirty();
 }
 
+void GPIO_IRQ_HANDLER(void) {
+    /* Check/clear Port 2, bit 3 interrupt */
+    uint32_t stat = Chip_GPIOINT_GetStatusRising(LPC_GPIOINT, GPIOINT_PORT2) |
+                    Chip_GPIOINT_GetStatusFalling(LPC_GPIOINT, GPIOINT_PORT2);
+
+    if (stat & (1u << GPIO_BUTTON_PIN)) {
+        /* Latch flag = 0x02 on any press edge (we use falling by default) */
+        g_status_ext = 0x02;
+
+        /* Clear both edges just in case */
+        Chip_GPIOINT_ClearIntStatus(LPC_GPIOINT, GPIOINT_PORT2, (1u << GPIO_BUTTON_PIN));
+    }
+}
+
 /* ----------------------------------- Main ---------------------------------- */
 int main(void) {
     SystemCoreClockUpdate();
     Board_Init();
+
+    Chip_GPIO_SetPinDIRInput(LPC_GPIO, GPIO_BUTTON_PORT, GPIO_BUTTON_PIN);
+    Chip_GPIOINT_SetIntFalling(LPC_GPIOINT, GPIOINT_PORT2, (1u << GPIO_BUTTON_PIN));
+    NVIC_ClearPendingIRQ(GPIO_NVIC_NAME);
+    NVIC_SetPriority(GPIO_NVIC_NAME, 2);   /* higher prio than UART0 status tx if you want snappy flag */
+    NVIC_EnableIRQ(GPIO_NVIC_NAME);
 
     /* WS pins: P3.25 (B1), P3.26 (B2) as GPIO outputs */
     Chip_IOCON_Init(LPC_IOCON);
