@@ -20,6 +20,7 @@ STATIC const PINMUX_GRP_T pinmuxing[] = {
 	{3, 26, IOCON_FUNC0 | IOCON_MODE_INACT}, /* addr LED1 */
 	{3, 25, IOCON_FUNC0 | IOCON_MODE_INACT}, /* addr LED2 */
 
+	{2, 4, IOCON_FUNC0 | IOCON_MODE_PULLUP}, /* sw1 */
     {2, 3, IOCON_FUNC0 | IOCON_MODE_PULLUP}, /* sw2 */
 };
 
