@@ -92,7 +92,7 @@ static inline bool u1q_pop_main(U1Frame *out){
     return true;
 }
 
-typedef struct { uint8_t data[9]; uint8_t len; } U2Frame;
+typedef struct { uint8_t data[64]; uint8_t len; } U2Frame;
 #define U2_TXQ_CAP 128
 static volatile uint8_t u2_head = 0, u2_tail = 0;
 static U2Frame u2_q[U2_TXQ_CAP];
@@ -256,6 +256,48 @@ static inline uint8_t job_alloc(uint8_t con, uint8_t led){
 static inline bool is_conn_configured(uint8_t con){
     for (uint8_t i = 0; i < cfg_count; ++i) if (cfg_conn[i] == con) return true;
     return false;
+}
+
+static inline void bin_enqueue_multi_mask_uart2(uint8_t max_led, const uint8_t *list){
+    if (max_led == 0) return;
+    // Build: SOF, GRP_RX_TO_SLV, LEN, SC_SLAVE(0x85), bin(0x01), sub(0x04),
+    //        max_led, list[max_led], END
+    uint8_t len = (uint8_t)(3 /*85,bin,sub*/ + 1 /*max*/ + max_led);
+    const uint8_t total = (uint8_t)(len + 3); // SOF + GRP + LEN + ... + END fits in u2 frame
+
+    U2Frame fr;
+    uint8_t *p = fr.data;
+    *p++ = SOF;
+    *p++ = GRP_RX_TO_SLV;         // 0x97
+    *p++ = len;                   // bytes until END
+    *p++ = SC_SLAVE;              // 0x85
+    *p++ = 0x01;                  // bin id = 1 (WS mirror bin)
+    *p++ = 0x04;                  // BIN subcode (same family we used before)
+    *p++ = max_led;               // number of slots in the list
+    for (uint8_t i=0; i<max_led; ++i) *p++ = list[i];  // raw list (zeros allowed → skip)
+
+    *p++ = END_BYTE;
+
+    fr.len = (uint8_t)(p - fr.data);
+    if (fr.len <= sizeof(fr.data)) {
+        // push to U2 queue
+        (void)u2q_push_isr(fr.data, fr.len);
+    }
+}
+
+static inline void ws_set_mask_bin1_and_clear_others(uint8_t max_led, const uint8_t *list){
+    // clear all
+    memset(ws_buf, 0, sizeof(ws_buf));
+    // set listed (1-indexed), skip 0 entries
+    for (uint8_t i=0; i<max_led; ++i){
+        uint8_t led1 = list[i];
+        if (led1 == 0) continue;
+        if (led1 >= 1 && led1 <= WS_LED_COUNT){
+            uint16_t idx = (uint16_t)(led1 - 1);
+            ws_buf[idx].r = 255; ws_buf[idx].g = 0; ws_buf[idx].b = 0;
+        }
+    }
+    ws_dirty = true;
 }
 /* ===== status frame builder ===== */
 static uint8_t build_status_frame(uint8_t *dst, uint8_t cap){
@@ -484,6 +526,23 @@ static void handle_led1_multi_con(const uint8_t *pay, uint8_t pal){
     }
     NVIC_EnableIRQ(RITIMER_IRQn);
 }
+
+static void handle_bin_led_mask(const uint8_t *pay, uint8_t pal){
+    if (pal < 1) return;
+    const uint8_t max_led = pay[0];
+    if (max_led == 0) return;
+    if (pal < (uint8_t)(1 + max_led)) return;
+
+    // 1) Update WS strip to reflect exactly the list
+    ws_set_mask_bin1_and_clear_others(max_led, &pay[1]);
+
+    // 2) Stop per-LED streaming jobs on UART2 (optional but recommended to avoid interference)
+    u2_jobs_stop_all();
+
+    // 3) Send a single BIN multi-mask frame down UART2
+    bin_enqueue_multi_mask_uart2(max_led, &pay[1]);
+}
+
 /* UART0 RX (App->RX) */
 typedef enum { RXF_WAIT_SOF=0, RXF_WAIT_LEN, RXF_COLLECT_BODY, RXF_WAIT_END } rx_fsm_t;
 static volatile rx_fsm_t rx_state = RXF_WAIT_SOF;
@@ -506,6 +565,7 @@ static void dispatch_app_frame(const uint8_t *p, uint8_t len){
         case SC_RELAY_SET:     handle_relay_set(pay, pal);     break;
         case SC_BTNFLAG_RESET: handle_btnflag_reset(pay, pal); break;  /* updated */
         case SC_STATUS:        handle_led1_multi_con(pay, pal);    break;
+        case 0x0B:             handle_bin_led_mask(pay, pal);      break;
         default: break;
     }
     send_status();
