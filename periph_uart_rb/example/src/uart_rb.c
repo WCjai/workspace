@@ -64,6 +64,12 @@ static volatile uint32_t g_status01_mask = 0;
 /* Force Si=0x01 while connector remains triggered; bits auto-clear when trigger clears */
 static volatile uint32_t g_force01_while_triggered_mask = 0;
 
+#define BTN_DEBOUNCE_MS       1000
+#define BTN_DEBOUNCE_TICKS    ((BTN_DEBOUNCE_MS + RIT_TICK_MS - 1) / RIT_TICK_MS)
+
+static volatile uint16_t g_btn1_last_tick = 0;
+static volatile uint16_t g_btn2_last_tick = 0;
+
 typedef struct { uint8_t data[9]; uint8_t len; } U1Frame;
 #define U1_TXQ_CAP 128
 static volatile uint8_t u1_head = 0, u1_tail = 0;
@@ -620,21 +626,40 @@ void RIT_IRQHandler(void){
 }
 
 void GPIO_IRQ_HANDLER(void){
-    /* Latch both edges (reads rising|falling; we trigger on falling) */
-    uint32_t stat_r = Chip_GPIOINT_GetStatusRising (LPC_GPIOINT, GPIOINT_PORT2);
+    /* Read & clear falling first — we only ACT on falling (press-down) */
     uint32_t stat_f = Chip_GPIOINT_GetStatusFalling(LPC_GPIOINT, GPIOINT_PORT2);
-    uint32_t stat   = stat_r | stat_f;
-
-    /* P2.3 => add 2 (bit1) */
-    if (stat & (1u << GPIO_BUTTON_S2_PIN)){
-        g_status_ext |= BTN_P23_BIT;  /* set bit1 */
-        Chip_GPIOINT_ClearIntStatus(LPC_GPIOINT, GPIOINT_PORT2, (1u << GPIO_BUTTON_S2_PIN));
+    if (stat_f) {
+        Chip_GPIOINT_ClearIntStatus(LPC_GPIOINT, GPIOINT_PORT2, stat_f);
     }
 
-    /* P2.4 => add 1 (bit0) */
-    if (stat & (1u << GPIO_BUTTON_S1_PIN)){
-        g_status_ext |= BTN_P24_BIT;  /* set bit0 */
-        Chip_GPIOINT_ClearIntStatus(LPC_GPIOINT, GPIOINT_PORT2, (1u << GPIO_BUTTON_S1_PIN));
+    /* Also clear any latched rising edges, but DO NOT act on them */
+    uint32_t stat_r = Chip_GPIOINT_GetStatusRising(LPC_GPIOINT, GPIOINT_PORT2);
+    if (stat_r) {
+        Chip_GPIOINT_ClearIntStatus(LPC_GPIOINT, GPIOINT_PORT2, stat_r);
+    }
+
+    /* Debounced, falling-edge-only press detection (active-low) */
+    uint16_t now = (uint16_t)g_tick;
+
+    // P2.4 => S1 (bit0)
+    if (stat_f & (1u << GPIO_BUTTON_S1_PIN)) {
+        // Optional sanity: confirm still low (pressed)
+        if (!Chip_GPIO_GetPinState(LPC_GPIO, GPIO_BUTTON_PORT, GPIO_BUTTON_S1_PIN)) {
+            if ((int16_t)((uint16_t)now - g_btn1_last_tick) >= (int16_t)BTN_DEBOUNCE_TICKS) {
+                g_btn1_last_tick = now;
+                g_status_ext |= BTN_P24_BIT;   // set bit0 ONCE per press-down
+            }
+        }
+    }
+
+    // P2.3 => S2 (bit1)
+    if (stat_f & (1u << GPIO_BUTTON_S2_PIN)) {
+        if (!Chip_GPIO_GetPinState(LPC_GPIO, GPIO_BUTTON_PORT, GPIO_BUTTON_S2_PIN)) {
+            if ((int16_t)((uint16_t)now - g_btn2_last_tick) >= (int16_t)BTN_DEBOUNCE_TICKS) {
+                g_btn2_last_tick = now;
+                g_status_ext |= BTN_P23_BIT;   // set bit1 ONCE per press-down
+            }
+        }
     }
 }
 
@@ -650,7 +675,9 @@ int main(void){
     Chip_GPIOINT_ClearIntStatus(LPC_GPIOINT, GPIOINT_PORT2, (1u << GPIO_BUTTON_S1_PIN) | (1u << GPIO_BUTTON_S2_PIN));
 
     /* Arm falling-edge interrupts (active-low button to GND) */
-    Chip_GPIOINT_SetIntFalling(LPC_GPIOINT, GPIOINT_PORT2, (1u << GPIO_BUTTON_S1_PIN) | (1u << GPIO_BUTTON_S2_PIN));
+    Chip_GPIOINT_SetIntRising (LPC_GPIOINT, GPIOINT_PORT2, 0);  // disable rising
+    Chip_GPIOINT_SetIntFalling(LPC_GPIOINT, GPIOINT_PORT2,
+        (1u << GPIO_BUTTON_S1_PIN) | (1u << GPIO_BUTTON_S2_PIN));
 
     NVIC_ClearPendingIRQ(GPIO_NVIC_NAME);
     NVIC_SetPriority(GPIO_NVIC_NAME, 2);
