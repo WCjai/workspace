@@ -13,7 +13,7 @@
 
 #define GPIO_BUTTON_PORT 2
 #define GPIO_BUTTON_S2_PIN  3
-#define GPIO_BUTTON_S1_PIN 4
+#define GPIO_BUTTON_S1_PIN  4
 
 #define BTN_P24_BIT 0x01  /* P2.4 adds +1 */
 #define BTN_P23_BIT 0x02  /* P2.3 adds +2 */
@@ -32,8 +32,17 @@
 
 enum { SOF = 0x27, END_BYTE = 0x16 };
 enum { GRP_APP_TO_RX=0x85, GRP_RX_TO_APP=0x00, GRP_RX_TO_SLV=0x97, GRP_SLV_TO_RX=0x27 };
-enum { SC_POLL=0x00, SC_LED_CTRL=0x02, SC_UPLOAD_MAP=0x04, SC_LED_RESET=0x3A,
-       SC_RELAY_SET=0x06, SC_STATUS=0x0A, SC_BTNFLAG_RESET=0x09, SC_SLAVE=0x85 };
+enum {
+  SC_POLL=0x00,
+  SC_LED_CTRL=0x02,
+  SC_NEW_STATUS01=0x03,   /* new: one-shot Si=01 + LED reset behavior */
+  SC_UPLOAD_MAP=0x04,
+  SC_LED_RESET=0x3A,
+  SC_RELAY_SET=0x06,
+  SC_STATUS=0x0A,
+  SC_BTNFLAG_RESET=0x09,
+  SC_SLAVE=0x85
+};
 
 static volatile uint8_t g_status_ext = 0x00;
 
@@ -49,6 +58,11 @@ static volatile uint32_t round_alive_mask     = 0;
 static volatile uint32_t round_triggered_mask = 0;
 static volatile uint32_t g_alive_mask         = 0;
 static volatile uint32_t g_triggered_mask     = 0;
+
+/* One-shot override to Si=0x01 for next heartbeat */
+static volatile uint32_t g_status01_mask = 0;
+/* Force Si=0x01 while connector remains triggered; bits auto-clear when trigger clears */
+static volatile uint32_t g_force01_while_triggered_mask = 0;
 
 typedef struct { uint8_t data[9]; uint8_t len; } U1Frame;
 #define U1_TXQ_CAP 128
@@ -146,34 +160,6 @@ static volatile bool g_led_streaming_active = false;
 static volatile uint8_t g_tx_len = 0;
 static uint8_t          g_tx_buf[TX_FRAME_MAX];
 
-static uint8_t build_status_frame(uint8_t *dst, uint8_t cap){
-    const uint8_t N   = cfg_count;
-    const uint8_t LEN = (uint8_t)(N + 7);
-    const uint8_t TOT = (uint8_t)(LEN + 3);
-    if (TOT > cap) return 0;
-
-    const uint32_t view_alive = (g_alive_mask | round_alive_mask);
-    const uint32_t view_trig  = ((g_triggered_mask | round_triggered_mask) & view_alive);
-
-    uint8_t *p = dst;
-    *p++ = SOF; *p++ = LEN; *p++ = GRP_RX_TO_APP; *p++ = RX_ID; *p++ = SC_STATUS;
-    *p++ = g_status_ext; *p++ = N;
-    for (uint8_t i = 0; i < N; ++i) {
-        const uint8_t  c = cfg_conn[i];
-        const uint32_t b = (c >= 1 && c <= 31) ? (1u << (c - 1)) : 0;
-        uint8_t Si = 0x00;
-        if (view_alive & b) Si = (view_trig & b) ? 0x07 : 0x05;
-        *p++ = Si;
-    }
-    *p++ = 0x00; *p++ = 0x00;  /* reserved */
-    *p++ = END_BYTE;
-    return TOT;
-}
-static inline void send_status(void){
-    uint8_t n = build_status_frame(g_tx_buf, sizeof(g_tx_buf));
-    if (n) g_tx_len = n;
-}
-
 /* WS2812 */
 #define WS_LED_COUNT 96
 static RGB_t   ws_buf[WS_LED_COUNT];
@@ -223,16 +209,100 @@ static inline void u2_jobs_stop_all(void){
     for (uint8_t i = 0; i < MAX_U2_JOBS; ++i) g_u2_jobs[i].active = 0;
 }
 
-/* App handlers */
-static bool try_handle_ws_accessory(const uint8_t *pay, uint8_t pal){
-    if (pal < 9) return false;
-    if (pay[0] || pay[1] || pay[2]) return false;
-    if (pay[3] != 0x02) return false;
-    const uint8_t bin = pay[4], led = pay[5];
-    u2_job_start(bin, led);
-    if (bin == 1) ws_set_red_1indexed(led);
-    return true;
+/* ==== helpers for "reset-on-new" + de-dup ==== */
+static inline void u2_jobs_remove_by_bin_except(uint8_t bin, uint8_t keep_led){
+    for (uint8_t i=0;i<MAX_U2_JOBS;++i)
+        if (g_u2_jobs[i].active && g_u2_jobs[i].bin==bin && g_u2_jobs[i].led!=keep_led)
+            g_u2_jobs[i].active = 0;
 }
+static inline uint8_t u2_job_find(uint8_t bin, uint8_t led){
+    for (uint8_t i=0;i<MAX_U2_JOBS;++i)
+        if (g_u2_jobs[i].active && g_u2_jobs[i].bin==bin && g_u2_jobs[i].led==led) return i;
+    return 0xFF;
+}
+static volatile uint16_t ws_last_led_bin1 = 0;
+static inline void ws_set_only_bin1(uint16_t led1){
+    if (ws_last_led_bin1 && ws_last_led_bin1 <= WS_LED_COUNT){
+        const uint16_t i = (uint16_t)(ws_last_led_bin1 - 1);
+        ws_buf[i].r = ws_buf[i].g = ws_buf[i].b = 0;
+        ws_dirty = true;
+    }
+    ws_last_led_bin1 = led1;
+    ws_set_red_1indexed(led1);
+}
+
+static inline void jobs_remove_by_con_except(uint8_t con, uint8_t keep_led){
+    for (uint8_t i=0;i<MAX_LED_JOBS;++i)
+        if (g_jobs[i].active && g_jobs[i].con==con && g_jobs[i].led!=keep_led)
+            g_jobs[i].active = 0;
+}
+static inline uint8_t job_find(uint8_t con, uint8_t led){
+    for (uint8_t i=0;i<MAX_LED_JOBS;++i)
+        if (g_jobs[i].active && g_jobs[i].con==con && g_jobs[i].led==led) return i;
+    return 0xFF;
+}
+static inline uint8_t job_alloc(uint8_t con, uint8_t led){
+    for (uint8_t i=0;i<MAX_LED_JOBS;++i)
+        if (!g_jobs[i].active){ g_jobs[i]=(LedJob){con,led,(uint16_t)g_tick,1}; return i; }
+    return 0xFF;
+}
+
+/* ===== status frame builder ===== */
+static uint8_t build_status_frame(uint8_t *dst, uint8_t cap){
+    const uint8_t N   = cfg_count;
+    const uint8_t LEN = (uint8_t)(N + 7);
+    const uint8_t TOT = (uint8_t)(LEN + 3);
+    if (TOT > cap) return 0;
+
+    const uint32_t view_alive = (g_alive_mask | round_alive_mask);
+    const uint32_t view_trig  = ((g_triggered_mask | round_triggered_mask) & view_alive);
+
+    uint8_t *p = dst;
+    *p++ = SOF; *p++ = LEN; *p++ = GRP_RX_TO_APP; *p++ = RX_ID; *p++ = SC_STATUS;
+    *p++ = g_status_ext; *p++ = N;
+
+    for (uint8_t i = 0; i < N; ++i) {
+        const uint8_t  c = cfg_conn[i];
+        const uint32_t b = (c >= 1 && c <= 31) ? (1u << (c - 1)) : 0;
+
+        uint8_t Si = 0x00;
+        const bool alive    = (view_alive & b) != 0;
+        const bool trig_now = (view_trig  & b) != 0;
+
+        /* one-shot override to 0x01 */
+        if ((g_status01_mask == 0xFFFFFFFFu) || (b && (g_status01_mask & b))) {
+            Si = 0x01;
+        } else {
+            /* force-01-while-triggered behavior */
+            if (g_force01_while_triggered_mask & b) {
+                if (trig_now) {
+                    Si = 0x01;      /* override 07→01 while trigger active */
+                } else {
+                    g_force01_while_triggered_mask &= ~b; /* drop override when trigger clears */
+                    Si = alive ? 0x05 : 0x00;
+                }
+            } else {
+                Si = alive ? (trig_now ? 0x07 : 0x05) : 0x00;
+            }
+        }
+
+        *p++ = Si;
+    }
+
+    *p++ = 0x00; *p++ = 0x00;  /* reserved */
+    *p++ = END_BYTE;
+    return TOT;
+}
+
+static inline void send_status(void){
+    uint8_t n = build_status_frame(g_tx_buf, sizeof(g_tx_buf));
+    if (n) {
+        g_tx_len = n;
+        g_status01_mask = 0;   /* clear one-shot after preparing reply */
+    }
+}
+
+/* Upload-map */
 static void handle_upload_map(const uint8_t *pay, uint8_t pal){
     if (pal < 1) return;
     const uint8_t N = pay[0];
@@ -250,43 +320,134 @@ static inline void clear_btn_p23_only(void) {
     g_status_ext &= (uint8_t)~BTN_P23_BIT;   // clear bit1, keep bit0
 }
 
+/* ===== SC=0x02 (LED ON) — mode-based right after SC =====
+   mode = 0x00 : [00, 00, 00, 02, bin, led]    // legacy-as-current → BIN/UART2 + WS mirror for bin==1
+   mode = 0x01 : [01, con, led]                // UART1 (connector)
+   mode = 0x02 : [02, bin, bin_led, flags, con, con_led] // BIN + UART1 in one frame
+*/
 static void handle_led_ctrl(const uint8_t *pay, uint8_t pal){
-    if (try_handle_ws_accessory(pay, pal)) return;
     if (pal < 3) return;
-    const uint8_t state = pay[0], con = pay[1], led = pay[2];
-    if (state){
-        for (uint8_t i = 0; i < MAX_LED_JOBS; ++i){
-            if (!g_jobs[i].active){
-                g_jobs[i].con = con; g_jobs[i].led = led;
-                g_jobs[i].next_allowed_tick = g_tick; g_jobs[i].active = 1; break;
-            }
-        }
-    } else {
-        for (uint8_t i = 0; i < MAX_LED_JOBS; ++i){
-            if (g_jobs[i].active && g_jobs[i].con == con && g_jobs[i].led == led){ g_jobs[i].active = 0; break; }
-        }
-        u2_jobs_stop_by_led(led);
-        g_off_broadcast_pending  = 1;
-        g_off_broadcast2_pending = 1;
+    const uint8_t mode = pay[0];
 
-       clear_btn_p23_only(); 
+    if (mode == 0x00){
+        if (pal < 6) return;
+        if (pay[1] != 0x00 || pay[2] != 0x00 || pay[3] != 0x02) return;
+        const uint8_t bin = pay[4], led = pay[5];
+
+        NVIC_DisableIRQ(RITIMER_IRQn);
+        u2_jobs_remove_by_bin_except(bin, led);
+        u2_job_start(bin, led);
+        uint8_t idx = u2_job_find(bin, led);
+        if (idx != 0xFF){
+            g_u2_jobs[idx].next_allowed_tick = (uint16_t)g_tick;
+            u2_jobs_rr = idx;
+        }
+        NVIC_EnableIRQ(RITIMER_IRQn);
+
+        if (bin == 1) ws_set_only_bin1(led);
+        return;
     }
+
+    if (mode == 0x01){
+        if (pal < 3) return;
+        const uint8_t con = pay[1], led = pay[2];
+
+        NVIC_DisableIRQ(RITIMER_IRQn);
+        jobs_remove_by_con_except(con, led);
+        uint8_t idx = job_find(con, led);
+        if (idx == 0xFF) idx = job_alloc(con, led);
+        if (idx != 0xFF){
+            g_jobs[idx].next_allowed_tick = (uint16_t)g_tick;
+            jobs_rr = idx;
+        }
+        NVIC_EnableIRQ(RITIMER_IRQn);
+        return;
+    }
+
+    if (mode == 0x02){
+        if (pal < 6) return;
+        const uint8_t bin     = pay[1];
+        const uint8_t bin_led = pay[2];
+        /* const uint8_t flags = pay[3]; */ (void)pay;
+        const uint8_t con     = pay[4];
+        const uint8_t con_led = pay[5];
+
+        /* BIN side */
+        NVIC_DisableIRQ(RITIMER_IRQn);
+        u2_jobs_remove_by_bin_except(bin, bin_led);
+        u2_job_start(bin, bin_led);
+        uint8_t bidx = u2_job_find(bin, bin_led);
+        if (bidx != 0xFF){
+            g_u2_jobs[bidx].next_allowed_tick = (uint16_t)g_tick;
+            u2_jobs_rr = bidx;
+        }
+        NVIC_EnableIRQ(RITIMER_IRQn);
+        if (bin == 1) ws_set_only_bin1(bin_led);
+
+        /* UART1 side */
+        NVIC_DisableIRQ(RITIMER_IRQn);
+        jobs_remove_by_con_except(con, con_led);
+        uint8_t cidx = job_find(con, con_led);
+        if (cidx == 0xFF) cidx = job_alloc(con, con_led);
+        if (cidx != 0xFF){
+            g_jobs[cidx].next_allowed_tick = (uint16_t)g_tick;
+            jobs_rr = cidx;
+        }
+        NVIC_EnableIRQ(RITIMER_IRQn);
+        return;
+    }
+
+    /* Unknown mode → ignore */
 }
+
 static void handle_led_reset(const uint8_t *pay, uint8_t pal){
     (void)pay; (void)pal;
     for (uint8_t i = 0; i < MAX_LED_JOBS; ++i) g_jobs[i].active = 0;
     g_off_broadcast_pending  = 1;
     u2_jobs_stop_all();
     g_off_broadcast2_pending = 1;
-    clear_btn_p23_only(); 
+    clear_btn_p23_only();
     ws_clear_all();
 }
+
 static void handle_relay_set(const uint8_t *pay, uint8_t pal){
     if (pal < 2) return;
     Board_Relay_Set(pay[0], (pay[1] == 0x01));
 }
+
+/* NEW: SC=0x03 — one-shot Si=01 + full LED reset behavior */
+static void handle_status01_once(const uint8_t *pay, uint8_t pal){
+    /* one-shot override mask (all or single connector) */
+    if (pal == 0 || (pal >= 1 && pay[0] == 0x00)) {
+        g_status01_mask = 0xFFFFFFFFu;
+    } else {
+        const uint8_t con = pay[0];
+        if (con >= 1 && con <= 31) g_status01_mask = (1u << (con - 1));
+        else g_status01_mask = 0;
+    }
+    /* perform full LED reset behavior */
+    handle_led_reset(NULL, 0);
+}
+
+/* UPDATED: SC=0x09 — clear buttons + OFF + force 01 while currently triggered */
 static void handle_btnflag_reset(const uint8_t *pay, uint8_t pal){
-    (void)pay; (void)pal; g_status_ext = 0x00;
+    (void)pay; (void)pal;
+    g_status_ext = 0x00; /* clear both button bits */
+
+    const uint32_t view_alive = (g_alive_mask | round_alive_mask);
+    const uint32_t view_trig  = ((g_triggered_mask | round_triggered_mask) & view_alive);
+
+    /* Force 01 only for connectors that are currently triggered; persists while triggered */
+    g_force01_while_triggered_mask |= view_trig;
+
+    /* Turn everything OFF immediately */
+    g_off_broadcast_pending  = 1;
+    g_off_broadcast2_pending = 1;
+    ws_clear_all();
+
+    /* stop active LED jobs so OFF persists while waiting for triggers to clear */
+    for (uint8_t i = 0; i < MAX_LED_JOBS; ++i) g_jobs[i].active = 0;
+    u2_jobs_stop_all();
 }
 
 /* UART0 RX (App->RX) */
@@ -303,12 +464,13 @@ static void dispatch_app_frame(const uint8_t *p, uint8_t len){
     const uint8_t pal  = (len > 3) ? (uint8_t)(len - 3) : 0;
     if (group != GRP_APP_TO_RX || id != RX_ID) return;
     switch (sc){
-        case SC_POLL: break;
+        case SC_POLL:          break;
         case SC_UPLOAD_MAP:    handle_upload_map(pay, pal);    break;
         case SC_LED_CTRL:      handle_led_ctrl(pay, pal);      break;
+        case SC_NEW_STATUS01:  handle_status01_once(pay, pal); break;  /* new */
         case SC_LED_RESET:     handle_led_reset(pay, pal);     break;
         case SC_RELAY_SET:     handle_relay_set(pay, pal);     break;
-        case SC_BTNFLAG_RESET: handle_btnflag_reset(pay, pal); break;
+        case SC_BTNFLAG_RESET: handle_btnflag_reset(pay, pal); break;  /* updated */
         default: break;
     }
     send_status();
@@ -458,7 +620,7 @@ void RIT_IRQHandler(void){
 }
 
 void GPIO_IRQ_HANDLER(void){
-    /* Latch both edges (your code reads rising|falling; we trigger on falling) */
+    /* Latch both edges (reads rising|falling; we trigger on falling) */
     uint32_t stat_r = Chip_GPIOINT_GetStatusRising (LPC_GPIOINT, GPIOINT_PORT2);
     uint32_t stat_f = Chip_GPIOINT_GetStatusFalling(LPC_GPIOINT, GPIOINT_PORT2);
     uint32_t stat   = stat_r | stat_f;
@@ -482,7 +644,7 @@ int main(void){
     Board_Init();
 
     Chip_GPIO_SetPinDIRInput(LPC_GPIO, GPIO_BUTTON_PORT, GPIO_BUTTON_S1_PIN);      // P2.3
-    Chip_GPIO_SetPinDIRInput(LPC_GPIO, GPIO_BUTTON_PORT, GPIO_BUTTON_S2_PIN);     // P2.4
+    Chip_GPIO_SetPinDIRInput(LPC_GPIO, GPIO_BUTTON_PORT, GPIO_BUTTON_S2_PIN);      // P2.4
 
     /* Clear any latched edge flags *before* enabling */
     Chip_GPIOINT_ClearIntStatus(LPC_GPIOINT, GPIOINT_PORT2, (1u << GPIO_BUTTON_S1_PIN) | (1u << GPIO_BUTTON_S2_PIN));
@@ -494,10 +656,8 @@ int main(void){
     NVIC_SetPriority(GPIO_NVIC_NAME, 2);
     NVIC_EnableIRQ(GPIO_NVIC_NAME);
 
-
     Chip_IOCON_Init(LPC_IOCON);
     Chip_GPIO_Init(LPC_GPIO);
-
 
     Chip_IOCON_PinMuxSet(LPC_IOCON, 3, 25, IOCON_FUNC0 | IOCON_MODE_INACT);
     Chip_IOCON_PinMuxSet(LPC_IOCON, 3, 26, IOCON_FUNC0 | IOCON_MODE_INACT);
