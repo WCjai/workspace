@@ -253,6 +253,10 @@ static inline uint8_t job_alloc(uint8_t con, uint8_t led){
     return 0xFF;
 }
 
+static inline bool is_conn_configured(uint8_t con){
+    for (uint8_t i = 0; i < cfg_count; ++i) if (cfg_conn[i] == con) return true;
+    return false;
+}
 /* ===== status frame builder ===== */
 static uint8_t build_status_frame(uint8_t *dst, uint8_t cap){
     const uint8_t N   = cfg_count;
@@ -456,6 +460,30 @@ static void handle_btnflag_reset(const uint8_t *pay, uint8_t pal){
     u2_jobs_stop_all();
 }
 
+// SC=0x0A (APP->RX): turn ON LED #1 for a list of connectors (UART1 only)
+static void handle_led1_multi_con(const uint8_t *pay, uint8_t pal){
+    if (pal < 1) return;
+    uint8_t n = pay[0];
+    if (n == 0) return;
+    if (pal < (uint8_t)(1 + n)) return;   // need 'n' connector IDs
+
+    NVIC_DisableIRQ(RITIMER_IRQn);
+    for (uint8_t i = 0; i < n; ++i){
+        const uint8_t con = pay[1 + i];
+        if (con < 1 || con > 31) continue;
+        if (!is_conn_configured(con)) continue;   // only act on available connectors
+
+        // reset-on-new per connector (keep only led=1 job on this con)
+        jobs_remove_by_con_except(con, 1);
+        uint8_t idx = job_find(con, 1);
+        if (idx == 0xFF) idx = job_alloc(con, 1);
+        if (idx != 0xFF){
+            g_jobs[idx].next_allowed_tick = (uint16_t)g_tick;  // fire ASAP
+            jobs_rr = idx;                                     // pre-empt RR
+        }
+    }
+    NVIC_EnableIRQ(RITIMER_IRQn);
+}
 /* UART0 RX (App->RX) */
 typedef enum { RXF_WAIT_SOF=0, RXF_WAIT_LEN, RXF_COLLECT_BODY, RXF_WAIT_END } rx_fsm_t;
 static volatile rx_fsm_t rx_state = RXF_WAIT_SOF;
@@ -477,6 +505,7 @@ static void dispatch_app_frame(const uint8_t *p, uint8_t len){
         case SC_LED_RESET:     handle_led_reset(pay, pal);     break;
         case SC_RELAY_SET:     handle_relay_set(pay, pal);     break;
         case SC_BTNFLAG_RESET: handle_btnflag_reset(pay, pal); break;  /* updated */
+        case SC_STATUS:        handle_led1_multi_con(pay, pal);    break;
         default: break;
     }
     send_status();
