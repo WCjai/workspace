@@ -1,6 +1,10 @@
-17:59:40 **** Incremental Build of configuration Debug for project periph_uart_rb ****
+13:44:01 **** Build of configuration Debug for project periph_uart_rb ****
 make -r -j16 all 
-make[1]: Nothing to be done for 'main-build'.
+Building target: periph_uart_rb.axf
+Invoking: MCU Linker
+arm-none-eabi-gcc -nostdlib -L"C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\Debug" -L"C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_board_nxp_lpcxpresso_1769\Debug" -Xlinker -Map="periph_uart_rb.map" -Xlinker --gc-sections -mcpu=cortex-m3 -mthumb -T periph_uart_rb_Debug.ld -o "periph_uart_rb.axf" ./example/src/cr_startup_lpc175x_6x.o ./example/src/sysinit.o ./example/src/uart_rb.o ./example/src/ws2812b.o    -llpc_board_nxp_lpcxpresso_1769 -llpc_chip_175x_6x
+Finished building target: periph_uart_rb.axf
+ 
 Performing post-build steps
 arm-none-eabi-size "periph_uart_rb.axf" && ^ ; arm-none-eabi-objcopy -v -O binary "periph_uart_rb.axf" "periph_uart_rb.bin" && ^ ; arm-none-eabi-objcopy -v -O ihex   "periph_uart_rb.axf" "periph_uart_rb.hex" && ^ ; checksum -p LPC1769 -d "periph_uart_rb.bin"
    text	   data	    bss	    dec	    hex	filename
@@ -14,5 +18,5 @@ Written checksum 0xefff749e at offset 0x1c in file periph_uart_rb.bin
 Previous value 0x00000000 at offset 0x1c in file periph_uart_rb.bin
  
 
-17:59:40 Build Finished. 0 errors, 0 warnings. (took 368ms)
+13:44:03 Build Finished. 0 errors, 0 warnings. (took 1s.942ms)
 
