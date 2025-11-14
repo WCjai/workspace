@@ -1,0 +1,42 @@
+13:43:59 **** Build of configuration Debug for project lpc_chip_175x_6x ****
+make -r -j16 all 
+make[1]: Nothing to be done for 'main-build'.
+Performing post-build steps
+arm-none-eabi-size "liblpc_chip_175x_6x.a" ; # arm-none-eabi-objdump -h -S "liblpc_chip_175x_6x.a" >"liblpc_chip_175x_6x.lss"
+   text	   data	    bss	    dec	    hex	filename
+    934	      0	      0	    934	    3a6	adc_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+   8624	      0	      0	   8624	   21b0	can_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+    172	      0	      4	    176	     b0	chip_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+   1602	      0	      0	   1602	    642	clock_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+      0	      0	      0	      0	      0	cmp_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+      0	      0	      0	      0	      0	crc_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+    140	      0	      0	    140	     8c	dac_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+      0	      0	      0	      0	      0	eeprom_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+      0	      0	      0	      0	      0	emc_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+   1091	      0	      4	   1095	    447	enet_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+   2320	     96	      8	   2424	    978	gpdma_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+      0	      0	      0	      0	      0	gpio_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+      0	      0	      0	      0	      0	gpioint_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+   3617	     84	    120	   3821	    eed	i2c_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+   1714	      0	      0	   1714	    6b2	i2s_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+    552	      0	      0	    552	    228	iap.o (ex liblpc_chip_175x_6x.a)
+    302	      0	      0	    302	    12e	iocon_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+      0	      0	      0	      0	      0	lcd_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+    280	      0	      0	    280	    118	pmu_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+    962	      0	      0	    962	    3c2	ring_buffer.o (ex liblpc_chip_175x_6x.a)
+    238	      0	      0	    238	     ee	ritimer_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+    746	      0	      0	    746	    2ea	rtc_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+      0	      0	      0	      0	      0	sdc_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+      0	      0	      0	      0	      0	sdmmc_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+   1038	      0	      0	   1038	    40e	spi_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+   2266	      0	      0	   2266	    8da	ssp_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+    362	      0	     12	    374	    176	stopwatch_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+     44	      0	      0	     44	     2c	sysctl_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+    470	      0	      0	    470	    1d6	sysinit_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+    310	      0	      0	    310	    136	timer_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+   2326	      0	      1	   2327	    917	uart_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+     94	      0	      0	     94	     5e	wwdt_17xx_40xx.o (ex liblpc_chip_175x_6x.a)
+ 
+
+13:44:00 Build Finished. 0 errors, 0 warnings. (took 670ms)
+

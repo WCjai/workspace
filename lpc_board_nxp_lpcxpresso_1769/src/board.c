@@ -24,8 +24,11 @@ static const relay_pin_t kRelayPins[6] = {
    { RELAY6_GPIO_PORT_NUM, RELAY6_GPIO_BIT_NUM },
 };
 
-const uint32_t OscRateIn    = 12000000;
-const uint32_t RTCOscRateIn = 32768;
+//const uint32_t OscRateIn    = 12000000;
+//const uint32_t RTCOscRateIn = 32768;
+
+const uint32_t OscRateIn   = 12000000;   // main oscillator input
+const uint32_t RTCOscRateIn = 0;         // or 32768 if you have an RTC crystal
 
 void Board_Relays_Init(void) {
     for (unsigned i = 0; i < 6; ++i) {
@@ -33,6 +36,13 @@ void Board_Relays_Init(void) {
         Chip_GPIO_WriteDirBit(LPC_GPIO, rp->port, rp->pin, true);
         Chip_GPIO_WritePortBit(LPC_GPIO, rp->port, rp->pin, false);
     }
+}
+
+void Board_ws2812_Init(void) {
+    Chip_IOCON_Init(LPC_IOCON);
+    Chip_GPIO_Init(LPC_GPIO);
+    Chip_GPIO_Init(LPC_GPIO3);
+    LPC_SYSCTL->PCONP |= (1 << 15);
 }
 
 void Board_Relay_Set(uint8_t relay, bool on) {

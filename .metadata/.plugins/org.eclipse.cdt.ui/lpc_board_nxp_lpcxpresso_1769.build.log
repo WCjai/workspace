@@ -1,0 +1,12 @@
+13:43:58 **** Build of configuration Debug for project lpc_board_nxp_lpcxpresso_1769 ****
+make -r -j16 all 
+make[1]: Nothing to be done for 'main-build'.
+Performing post-build steps
+arm-none-eabi-size "liblpc_board_nxp_lpcxpresso_1769.a" ; # arm-none-eabi-objdump -h -S "liblpc_board_nxp_lpcxpresso_1769.a" >"liblpc_board_nxp_lpcxpresso_1769.lss"
+   text	   data	    bss	    dec	    hex	filename
+    688	      0	      0	    688	    2b0	board.o (ex liblpc_board_nxp_lpcxpresso_1769.a)
+    214	      0	      0	    214	     d6	board_sysinit.o (ex liblpc_board_nxp_lpcxpresso_1769.a)
+ 
+
+13:43:59 Build Finished. 0 errors, 0 warnings. (took 671ms)
+

@@ -1,0 +1,344 @@
+#include "chip.h"
+#include "board.h"
+#include <stdbool.h>
+#include <string.h>
+
+/* =============================================================================
+   RX <-> APP Protocol replica + UART1 slave pinger
+   ============================================================================= */
+
+#define UART_APP        LPC_UART0
+#define IRQ_APP         UART0_IRQn
+#define HANDLER_APP     UART0_IRQHandler
+
+#define UART_SLAVE      LPC_UART1
+#define IRQ_SLAVE       UART1_IRQn
+#define HANDLER_SLAVE   UART1_IRQHandler
+
+#define RX_ID           0x01
+
+/* ---- Bytes & groups ---- */
+enum { SOF = 0x27, END_BYTE = 0x16 };
+enum { GRP_APP_TO_RX = 0x85, GRP_RX_TO_APP = 0x00 };
+enum { SC_POLL = 0x00, SC_LED_CTRL = 0x02, SC_UPLOAD_MAP = 0x04, SC_LED_RESET = 0x3A, SC_RELAY_SET = 0x06 };
+enum { SC_STATUS = 0x0A };
+
+/* ---- Slave UART1 frames you decoded ----
+   If your captures actually show 0x09 / 0x08 as LEN, change these two defines.
+*/
+#define SLAVE_LEN_ON        0x97 /* else 0x09 */
+#define SLAVE_LEN_OFF       0x97 /* else 0x08 */
+#define SLAVE_LEN_PING      0x97 /* else 0x09 */
+
+/* ---- Limits & buffers ---- */
+#define MAX_CFG             31
+#define RX_LEN_MAX          (4 + 2*MAX_CFG)   /* largest incoming LEN (Upload-Map: 4+2N) */
+#define TX_FRAME_MAX        (MAX_CFG + 10)    /* largest on-wire status: LEN+3 = (N+7)+3 */
+
+/* ---- Ping cadence ---- */
+#define PING_PREMAP_MS      55u
+#define PING_AFTERMAP_MS    50u
+
+/* ----------------------------- State & helpers ----------------------------- */
+
+/* configured connectors (state==1) in order */
+static uint8_t cfg_conn[MAX_CFG];
+static uint8_t cfg_count = 0;
+
+/* dynamic "alive" set, bit i means connector i present (1..31) */
+static volatile uint32_t alive_mask = 0;
+
+static inline void alive_clear_all(void)        { alive_mask = 0; }
+static inline void alive_set(uint8_t con)       { if (con >= 1 && con <= 31) alive_mask |= (1u << con); }
+static inline bool is_alive(uint8_t con)        { return (con >= 1 && con <= 31) && ((alive_mask >> con) & 1u); }
+
+/* LED -> UART1 emitters  --------------------------------------------------- */
+static inline void slave_send_led_on(uint8_t con, uint8_t led) {
+    /* 27, 97, 05, 85, con, 02, 01, led, 16 */
+    uint8_t f[9] = { 0x27, SLAVE_LEN_ON, 0x05, 0x85, con, 0x02, 0x01, led, 0x16 };
+    Chip_UART_SendBlocking(UART_SLAVE, f, sizeof f);
+}
+
+static inline void slave_send_led_off_broadcast(void) {
+    /* 27, 97, 04, 85, FF, 00, 00, 16  (use 00 00 as per your note) */
+    uint8_t f[8] = { 0x27, SLAVE_LEN_OFF, 0x04, 0x85, 0xFF, 0x00, 0x00, 0x16 };
+    Chip_UART_SendBlocking(UART_SLAVE, f, sizeof f);
+}
+
+/* Slave "ping" emitters (UART1)  ------------------------------------------ */
+static inline void slave_send_ping_broadcast(void) {
+    /* pre-map keepalive every ~55 ms: 27 97 05 85 00 00 00 00 16 */
+    uint8_t f[9] = { 0x27, SLAVE_LEN_PING, 0x05, 0x85, 0x00, 0x00, 0x00, 0x00, 0x16 };
+    Chip_UART_SendBlocking(UART_SLAVE, f, sizeof f);
+}
+
+static inline void slave_send_ping_addr(uint8_t con) {
+    /* after-map per-connector round-robin: 27 97 05 85 <con> 00 00 00 16 */
+    uint8_t f[9] = { 0x27, SLAVE_LEN_PING, 0x05, 0x85, con, 0x00, 0x00, 0x00, 0x16 };
+    Chip_UART_SendBlocking(UART_SLAVE, f, sizeof f);
+}
+
+/* LED control wrappers used by App->RX LED command */
+static inline void led_on(uint8_t con, uint8_t led)  { slave_send_led_off_broadcast(); slave_send_led_on(con, led); }
+static inline void led_off(uint8_t con, uint8_t led) { (void)con; (void)led; slave_send_led_off_broadcast(); }
+
+/* Single TX queue for APP replies (sent outside ISR) ---------------------- */
+static volatile uint8_t g_tx_len = 0;
+static uint8_t          g_tx_buf[TX_FRAME_MAX];
+static inline void txq_queue(const uint8_t *data, uint8_t n) {
+    if (n > sizeof(g_tx_buf)) n = sizeof(g_tx_buf);
+    memcpy(g_tx_buf, data, n);
+    __DSB(); __ISB();
+    g_tx_len = n;
+}
+
+/* ----------------------- Building outgoing status frame -------------------- */
+
+static uint8_t build_status_frame(uint8_t *dst, uint8_t cap) {
+    const uint8_t N = cfg_count;
+    const uint8_t LEN   = (uint8_t)(N + 7);
+    const uint8_t TOTAL = (uint8_t)(LEN + 3);
+    if (TOTAL > cap) return 0;
+
+    uint8_t *p = dst;
+    *p++ = SOF;
+    *p++ = LEN;
+    *p++ = GRP_RX_TO_APP;
+    *p++ = RX_ID;
+    *p++ = SC_STATUS;
+    *p++ = 0x00;          /* flags */
+    *p++ = N;
+    for (uint8_t i = 0; i < N; ++i) {
+        const uint8_t con = cfg_conn[i];
+        *p++ = is_alive(con) ? 0x05 : 0x00;
+    }
+    *p++ = 0x00;          /* reserved */
+    *p++ = 0x00;          /* reserved */
+    *p++ = END_BYTE;
+    return TOTAL;
+}
+static inline void send_status(void) {
+    uint8_t n = build_status_frame(g_tx_buf, sizeof(g_tx_buf));
+    if (n) g_tx_len = n;
+}
+
+/* ----------------------------- Command handlers --------------------------- */
+
+static void handle_upload_map(const uint8_t *pay, uint8_t paylen) {
+    if (paylen < 1) return;
+    const uint8_t N = pay[0];
+    if (paylen < (uint8_t)(1 + 2U * N)) return;
+
+    cfg_count = 0;
+    for (uint8_t i = 0; i < N && cfg_count < MAX_CFG; ++i) {
+        const uint8_t con   = pay[1 + 2*i + 0];
+        const uint8_t state = pay[1 + 2*i + 1];
+        if (state == 0x01) cfg_conn[cfg_count++] = con;
+    }
+
+    /* we’ll clear alive_mask at the start of the first ping cycle after map */
+    send_status(); /* mirrors original device behavior */
+}
+
+static void handle_led_ctrl(const uint8_t *pay, uint8_t paylen) {
+    if (paylen < 3) return;
+    const uint8_t state = pay[0];
+    const uint8_t con   = pay[1];
+    const uint8_t led   = pay[2];
+    if (state) led_on(con, led); else led_off(con, led);
+}
+
+static void handle_led_reset(const uint8_t *pay, uint8_t paylen) {
+    (void)pay; (void)paylen;
+    slave_send_led_off_broadcast(); /* your observed behavior */
+}
+
+static void handle_relay_set(const uint8_t *pay, uint8_t paylen) {
+    if (paylen < 2) return;
+    const uint8_t relay = pay[0];
+    const bool    on    = (pay[1] == 0x01);
+    Board_Relay_Set(relay, on);
+}
+
+/* ----------------------------- APP RX parser (UART0) ---------------------- */
+
+typedef enum { RXF_WAIT_SOF=0, RXF_WAIT_LEN, RXF_COLLECT_BODY, RXF_WAIT_END } rx_fsm_t;
+
+static volatile rx_fsm_t app_state = RXF_WAIT_SOF;
+static volatile uint8_t  app_len   = 0;
+static uint8_t           app_buf[RX_LEN_MAX];
+static uint8_t           app_idx   = 0;
+
+static void dispatch_app_body(const uint8_t *p, uint8_t len) {
+    if (len < 3) return;
+    const uint8_t group = p[0];
+    const uint8_t id    = p[1];
+    const uint8_t sc    = p[2];
+    const uint8_t *pay  = (len > 3) ? &p[3] : NULL;
+    const uint8_t pal   = (len > 3) ? (uint8_t)(len - 3) : 0;
+
+    if (group != GRP_APP_TO_RX || id != RX_ID) return;
+
+    switch (sc) {
+        case SC_POLL:        send_status();                     break;
+        case SC_UPLOAD_MAP:  handle_upload_map(pay, pal);       break;
+        case SC_LED_CTRL:    handle_led_ctrl(pay, pal);         break;
+        case SC_LED_RESET:   handle_led_reset(pay, pal);        break;
+        case SC_RELAY_SET:   handle_relay_set(pay, pal);        break;
+        default: break;
+    }
+}
+
+void HANDLER_APP(void) {
+    while ((Chip_UART_ReadLineStatus(UART_APP) & UART_LSR_RDR) != 0) {
+        uint8_t b = Chip_UART_ReadByte(UART_APP);
+        switch (app_state) {
+        case RXF_WAIT_SOF:      if (b == SOF) app_state = RXF_WAIT_LEN; break;
+        case RXF_WAIT_LEN:
+            app_len = b;
+            if (app_len == 0 || app_len > RX_LEN_MAX) { app_state = RXF_WAIT_SOF; break; }
+            app_idx = 0; app_state = RXF_COLLECT_BODY; break;
+        case RXF_COLLECT_BODY:
+            if (app_idx < RX_LEN_MAX) {
+                app_buf[app_idx++] = b;
+                if (app_idx == app_len) app_state = RXF_WAIT_END;
+            } else app_state = RXF_WAIT_SOF;
+            break;
+        case RXF_WAIT_END:
+            if (b == END_BYTE) dispatch_app_body(app_buf, app_len);
+            app_state = RXF_WAIT_SOF; break;
+        default: app_state = RXF_WAIT_SOF; break;
+        }
+    }
+}
+
+/* ----------------------------- SLAVE RX parser (UART1) -------------------- */
+/* Expect frames like: 27 27 03 0A <addr> <limit> 16
+   - byte0  = 0x27
+   - byte1  = (often 0x27 in your trace; ignored)
+   - byte2  = LEN == 0x03
+   - byte3  = 0x0A
+   - byte4  = addr (connector number)
+   - byte5  = limit (01 = not trig, 03 = trig)
+   - byte6  = 0x16
+*/
+typedef enum { SLP_WAIT_SOF=0, SLP_GOT_SOF2, SLP_WAIT_LEN, SLP_WAIT_CMD, SLP_WAIT_ADDR, SLP_WAIT_LIMIT, SLP_WAIT_END } slv_fsm_t;
+
+static volatile slv_fsm_t slv_state = SLP_WAIT_SOF;
+static volatile uint8_t   slv_addr  = 0;
+
+static inline void slave_reply_update(uint8_t addr, uint8_t limit_state) {
+    (void)limit_state; /* stash if you want later */
+    alive_set(addr);
+}
+
+void HANDLER_SLAVE(void) {
+    while ((Chip_UART_ReadLineStatus(UART_SLAVE) & UART_LSR_RDR) != 0) {
+        uint8_t b = Chip_UART_ReadByte(UART_SLAVE);
+        switch (slv_state) {
+        case SLP_WAIT_SOF:    if (b == 0x27) slv_state = SLP_GOT_SOF2; break;
+        case SLP_GOT_SOF2:    /* second header byte (often 0x27); ignore */ slv_state = SLP_WAIT_LEN; break;
+        case SLP_WAIT_LEN:    if (b == 0x03) slv_state = SLP_WAIT_CMD; else slv_state = SLP_WAIT_SOF; break;
+        case SLP_WAIT_CMD:    if (b == 0x0A) slv_state = SLP_WAIT_ADDR; else slv_state = SLP_WAIT_SOF; break;
+        case SLP_WAIT_ADDR:   slv_addr = b; slv_state = SLP_WAIT_LIMIT; break;
+        case SLP_WAIT_LIMIT:  /* we could store this for later */
+            { uint8_t limit = b; slv_state = SLP_WAIT_END;
+              /* nothing else until END */ (void)limit; }
+            break;
+        case SLP_WAIT_END:
+            if (b == END_BYTE) {
+                /* valid short reply -> mark alive */
+                /* NOTE: if you want per-cycle freshness, we clear mask when cycle restarts */
+                slave_reply_update(slv_addr, /*limit*/0);
+            }
+            slv_state = SLP_WAIT_SOF; break;
+        default: slv_state = SLP_WAIT_SOF; break;
+        }
+    }
+}
+
+/* ----------------------------- Millisecond tick --------------------------- */
+static volatile uint32_t g_ms = 0;
+void SysTick_Handler(void) { g_ms++; }
+
+/* ----------------------------- Poll scheduler ----------------------------- */
+static uint32_t last_ping_ms = 0;
+static uint8_t  rr_index     = 0;    /* round-robin index into cfg_conn[] */
+static bool     cleared_this_cycle = false;
+
+static void poll_scheduler_step(void) {
+    const uint32_t now = g_ms;
+
+    if (cfg_count == 0) {
+        if (now - last_ping_ms >= PING_PREMAP_MS) {
+            slave_send_ping_broadcast();
+            last_ping_ms = now;
+        }
+        return;
+    }
+
+    if (now - last_ping_ms >= PING_AFTERMAP_MS) {
+        /* start of a fresh cycle -> clear alive to rebuild from replies */
+        if (rr_index == 0 && !cleared_this_cycle) {
+            alive_clear_all();
+            cleared_this_cycle = true;
+        }
+
+        uint8_t con = cfg_conn[rr_index];
+        slave_send_ping_addr(con);
+
+        rr_index++;
+        if (rr_index >= cfg_count) {
+            rr_index = 0;
+            cleared_this_cycle = false;   /* next tick will clear again */
+        }
+
+        last_ping_ms = now;
+    }
+}
+
+/* ---------------------------------- Main ---------------------------------- */
+int main(void) {
+    SystemCoreClockUpdate();
+    Board_Init();
+
+    /* UART0 (APP) 19,200 8N1 */
+    Chip_UART_Init(UART_APP);
+    Chip_UART_SetBaud(UART_APP, 19200);
+    Chip_UART_ConfigData(UART_APP, UART_LCR_WLEN8 | UART_LCR_SBS_1BIT);
+    Chip_UART_SetupFIFOS(UART_APP, UART_FCR_FIFO_EN | UART_FCR_TRG_LEV2);
+    Chip_UART_TXEnable(UART_APP);
+
+    /* UART1 (SLAVE) 9600 8N1  <-- use the baud your slave expects */
+    Chip_UART_Init(UART_SLAVE);
+    Chip_UART_SetBaud(UART_SLAVE, 9600);
+    Chip_UART_ConfigData(UART_SLAVE, UART_LCR_WLEN8 | UART_LCR_SBS_1BIT);
+    Chip_UART_SetupFIFOS(UART_SLAVE, UART_FCR_FIFO_EN | UART_FCR_TRG_LEV2);
+    Chip_UART_TXEnable(UART_SLAVE);
+
+    /* IRQs */
+    Chip_UART_IntEnable(UART_APP,   UART_IER_RBRINT | UART_IER_RLSINT);
+    NVIC_SetPriority(IRQ_APP, 1);
+    NVIC_EnableIRQ(IRQ_APP);
+
+    Chip_UART_IntEnable(UART_SLAVE, UART_IER_RBRINT | UART_IER_RLSINT);
+    NVIC_SetPriority(IRQ_SLAVE, 2);
+    NVIC_EnableIRQ(IRQ_SLAVE);
+
+    /* 1 ms SysTick for scheduler */
+    SysTick_Config(SystemCoreClock / 1000U);
+
+    for (;;) {
+        /* APP replies (heartbeat/status) */
+        if (g_tx_len) {
+            uint8_t n = g_tx_len;
+            Chip_UART_SendBlocking(UART_APP, g_tx_buf, n);
+            g_tx_len = 0;
+        }
+
+        /* drive UART1 ping cadence */
+        poll_scheduler_step();
+
+        __WFI();
+    }
+}

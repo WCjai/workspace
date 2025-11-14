@@ -1,0 +1,686 @@
+#include "chip.h"
+#include "board.h"
+#include <stdbool.h>
+#include <string.h>
+#include "ws2812b.h"
+
+/* UARTs:
+   - UART0: App (19200 8N1)
+   - UART1: Slaves (9600 8N1): LED streaming + polling
+   - UART2: BIN streaming (9600 8N1): continuous LED-ON only (no polling)
+   RIT (70 ms) schedules UART1 work, UART2 streaming, and sets WS flush flag (no WS writes in ISR).
+*/
+
+#define GPIO_BUTTON_PORT 2
+#define GPIO_BUTTON_S2_PIN  3
+#define GPIO_BUTTON_S1_PIN 4
+
+#define BTN_P24_BIT 0x01  /* P2.4 adds +1 */
+#define BTN_P23_BIT 0x02  /* P2.3 adds +2 */
+
+#define GPIO_IRQ_HANDLER EINT3_IRQHandler
+#define GPIO_NVIC_NAME   EINT3_IRQn
+
+#define UART_APP   LPC_UART0
+#define IRQ_APP    UART0_IRQn
+#define UART_SLAVE LPC_UART1
+#define IRQ_SLAVE  UART1_IRQn
+#define UART_BIN   LPC_UART2
+#define IRQ_BIN    UART2_IRQn
+
+#define RX_ID 0x01
+
+enum { SOF = 0x27, END_BYTE = 0x16 };
+enum { GRP_APP_TO_RX=0x85, GRP_RX_TO_APP=0x00, GRP_RX_TO_SLV=0x97, GRP_SLV_TO_RX=0x27 };
+enum { SC_POLL=0x00, SC_LED_CTRL=0x02, SC_UPLOAD_MAP=0x04, SC_LED_RESET=0x3A,
+       SC_RELAY_SET=0x06, SC_STATUS=0x0A, SC_BTNFLAG_RESET=0x09, SC_SLAVE=0x85, SC_NEW_STATUS01 = 0x03};
+
+static volatile uint8_t g_status_ext = 0x00;
+static volatile uint32_t g_status01_mask = 0;
+
+#define MAX_CFG      31
+#define RX_LEN_MAX   (4 + 2 * MAX_CFG)
+#define TX_FRAME_MAX (MAX_CFG + 10)
+
+static uint8_t cfg_conn[MAX_CFG];
+static uint8_t cfg_count = 0;
+
+#define CONN_BIT(c) (1u << ((c) - 1))
+static volatile uint32_t round_alive_mask     = 0;
+static volatile uint32_t round_triggered_mask = 0;
+static volatile uint32_t g_alive_mask         = 0;
+static volatile uint32_t g_triggered_mask     = 0;
+static volatile uint32_t g_force01_while_triggered_mask = 0;
+
+typedef struct { uint8_t data[9]; uint8_t len; } U1Frame;
+#define U1_TXQ_CAP 128
+static volatile uint8_t u1_head = 0, u1_tail = 0;
+static U1Frame u1_q[U1_TXQ_CAP];
+static volatile uint32_t u1_drops = 0;
+
+static inline bool u1q_push_isr(const uint8_t *d, uint8_t n){
+    const uint8_t next = (uint8_t)((u1_head + 1) % U1_TXQ_CAP);
+    if (next == u1_tail) { u1_drops++; return false; }
+    if (n > sizeof(u1_q[0].data)) n = sizeof(u1_q[0].data);
+    memcpy(u1_q[u1_head].data, d, n);
+    u1_q[u1_head].len = n;
+    u1_head = next;
+    return true;
+}
+static inline bool u1q_pop_main(U1Frame *out){
+    if (u1_tail == u1_head) return false;
+    *out = u1_q[u1_tail];
+    u1_tail = (uint8_t)((u1_tail + 1) % U1_TXQ_CAP);
+    return true;
+}
+
+typedef struct { uint8_t data[9]; uint8_t len; } U2Frame;
+#define U2_TXQ_CAP 128
+static volatile uint8_t u2_head = 0, u2_tail = 0;
+static U2Frame u2_q[U2_TXQ_CAP];
+static volatile uint32_t u2_drops = 0;
+
+static inline bool u2q_push_isr(const uint8_t *d, uint8_t n){
+    const uint8_t next = (uint8_t)((u2_head + 1) % U2_TXQ_CAP);
+    if (next == u2_tail) { u2_drops++; return false; }
+    if (n > sizeof(u2_q[0].data)) n = sizeof(u2_q[0].data);
+    memcpy(u2_q[u2_head].data, d, n);
+    u2_q[u2_head].len = n;
+    u2_head = next;
+    return true;
+}
+static inline bool u2q_pop_main(U2Frame *out){
+    if (u2_tail == u2_head) return false;
+    *out = u2_q[u2_tail];
+    u2_tail = (uint8_t)((u2_tail + 1) % U2_TXQ_CAP);
+    return true;
+}
+
+/* UART1 helpers */
+static inline void slave_enqueue_led_on(uint8_t con, uint8_t led){
+    uint8_t f[9] = { SOF, GRP_RX_TO_SLV, 0x05, SC_SLAVE, con, 0x02, 0x01, led, END_BYTE };
+    (void)u1q_push_isr(f, sizeof f);
+}
+static inline void slave_enqueue_led_off_broadcast(void){
+    uint8_t f[8] = { SOF, GRP_RX_TO_SLV, 0x04, SC_SLAVE, 0xFF, 0x03, 0x00, END_BYTE };
+    (void)u1q_push_isr(f, sizeof f);
+}
+static inline void slave_enqueue_poll(uint8_t con){
+    uint8_t f[9] = { SOF, GRP_RX_TO_SLV, 0x05, SC_SLAVE, con, 0x00, 0x00, 0x00, END_BYTE };
+    (void)u1q_push_isr(f, sizeof f);
+}
+
+/* UART2 helpers */
+static inline void bin_enqueue_led_on_uart2(uint8_t bin, uint8_t led){
+    uint8_t f[9] = { SOF, GRP_RX_TO_SLV, 0x05, SC_SLAVE, bin, 0x04, 0x01, led, END_BYTE };
+    (void)u2q_push_isr(f, sizeof f);
+}
+static inline void bin_enqueue_led_off_broadcast_uart2(void){
+    uint8_t f[8] = { SOF, GRP_RX_TO_SLV, 0x04, SC_SLAVE, 0xFF, 0x03, 0x00, END_BYTE };
+    (void)u2q_push_isr(f, sizeof f);
+}
+
+/* UART1 LED job scheduler */
+#define MAX_LED_JOBS             32
+#define RIT_TICK_MS              70
+#define LED_JOB_MIN_PERIOD_TICKS 1   /* ~70 ms per job */
+
+/* App (UART0) inactivity watchdog */
+#define APP_IDLE_MS    2000
+#define APP_IDLE_TICKS ((APP_IDLE_MS + RIT_TICK_MS - 1) / RIT_TICK_MS)
+
+static volatile uint32_t g_tick = 0;
+static volatile uint16_t g_app_last_activity_tick = 0;
+static volatile uint8_t  g_idle_ws_cleared = 0;
+
+typedef struct {
+    uint8_t  con, led;
+    uint16_t next_allowed_tick;
+    volatile uint8_t active;
+} LedJob;
+
+static volatile LedJob g_jobs[MAX_LED_JOBS];
+static volatile uint8_t g_off_broadcast_pending = 0;
+static uint8_t jobs_rr = 0;
+static volatile bool g_led_streaming_active = false;
+
+/* App heartbeat */
+static volatile uint8_t g_tx_len = 0;
+static uint8_t          g_tx_buf[TX_FRAME_MAX];
+
+static uint8_t build_status_frame(uint8_t *dst, uint8_t cap){
+    const uint8_t N   = cfg_count;
+    const uint8_t LEN = (uint8_t)(N + 7);
+    const uint8_t TOT = (uint8_t)(LEN + 3);
+    if (TOT > cap) return 0;
+
+    const uint32_t view_alive = (g_alive_mask | round_alive_mask);
+    const uint32_t view_trig  = ((g_triggered_mask | round_triggered_mask) & view_alive);
+
+    uint8_t *p = dst;
+    *p++ = SOF; *p++ = LEN; *p++ = GRP_RX_TO_APP; *p++ = RX_ID; *p++ = SC_STATUS;
+    *p++ = g_status_ext; *p++ = N;
+    for (uint8_t i = 0; i < N; ++i) {
+        const uint8_t  c = cfg_conn[i];
+        const uint32_t b = (c >= 1 && c <= 31) ? (1u << (c - 1)) : 0;
+        uint8_t Si = 0x00;
+
+        const bool alive    = (view_alive & b) != 0;
+        const bool trig_now = (view_trig  & b) != 0;
+
+        // --- NEW: “force 01 while triggered” behavior ---
+        if (g_force01_while_triggered_mask & b) {
+            if (trig_now) {
+                Si = 0x01;         // override 07→01 (only while trigger is active)
+            } else {
+                // trigger is gone -> drop override for this connector
+                g_force01_while_triggered_mask &= ~b;
+                // fall through to normal computation
+                Si = alive ? 0x05 : 0x00;
+            }
+        } else {
+            // normal computation
+            if (alive) Si = trig_now ? 0x07 : 0x05;
+        }
+
+        *p++ = Si;
+    }
+    *p++ = 0x00; *p++ = 0x00;  /* reserved */
+    *p++ = END_BYTE;
+    return TOT;
+}
+static inline void send_status(void){
+    uint8_t n = build_status_frame(g_tx_buf, sizeof(g_tx_buf));
+    if (n) {
+        g_tx_len = n;
+        g_status01_mask = 0;   // one-shot: clear after we’ve prepared a reply
+    }
+}
+
+/* WS2812 */
+#define WS_LED_COUNT 96
+static RGB_t   ws_buf[WS_LED_COUNT];
+static WS2812B ws_b1 = { .leds = ws_buf, .num_leds = WS_LED_COUNT };
+static WS2812B ws_b2 = { .leds = ws_buf, .num_leds = WS_LED_COUNT };
+static volatile bool   ws_dirty = false;
+static volatile uint8_t ws_flush_pending = 0; /* request flush in main loop */
+
+static inline void ws_clear_all(void){ memset(ws_buf, 0, sizeof(ws_buf)); ws_dirty = true; }
+static inline void ws_set_red_1indexed(uint16_t led1){
+    if (!led1 || led1 > WS_LED_COUNT) return;
+    const uint16_t idx = (uint16_t)(led1 - 1);
+    ws_buf[idx].r = 255; ws_buf[idx].g = 0; ws_buf[idx].b = 0; ws_dirty = true;
+}
+static inline void ws_flush_if_dirty(void){
+    if (!ws_dirty) return;
+    WS2812B_write(&ws_b1);
+    WS2812B_write(&ws_b2);
+    ws_dirty = false;
+}
+
+/* UART2 BIN streaming jobs */
+#define MAX_U2_JOBS             16
+#define U2_JOB_MIN_PERIOD_TICKS LED_JOB_MIN_PERIOD_TICKS
+typedef struct { uint8_t bin, led; uint16_t next_allowed_tick; volatile uint8_t active; } U2Job;
+static volatile U2Job g_u2_jobs[MAX_U2_JOBS];
+static uint8_t u2_jobs_rr = 0;
+static volatile uint8_t g_off_broadcast2_pending = 0;
+
+static inline void u2_job_start(uint8_t bin, uint8_t led){
+    for (uint8_t i = 0; i < MAX_U2_JOBS; ++i){
+        if (g_u2_jobs[i].active && g_u2_jobs[i].bin == bin && g_u2_jobs[i].led == led){
+            g_u2_jobs[i].next_allowed_tick = g_tick; return;
+        }
+    }
+    for (uint8_t i = 0; i < MAX_U2_JOBS; ++i){
+        if (!g_u2_jobs[i].active){
+            g_u2_jobs[i].bin = bin; g_u2_jobs[i].led = led;
+            g_u2_jobs[i].next_allowed_tick = g_tick; g_u2_jobs[i].active = 1; return;
+        }
+    }
+}
+static inline void u2_jobs_stop_by_led(uint8_t led){
+    for (uint8_t i = 0; i < MAX_U2_JOBS; ++i) if (g_u2_jobs[i].active && g_u2_jobs[i].led == led) g_u2_jobs[i].active = 0;
+}
+static inline void u2_jobs_stop_all(void){
+    for (uint8_t i = 0; i < MAX_U2_JOBS; ++i) g_u2_jobs[i].active = 0;
+}
+
+/* ==== New small helpers for "reset-on-new" + de-dup ==== */
+static inline void u2_jobs_remove_by_bin_except(uint8_t bin, uint8_t keep_led){
+    for (uint8_t i=0;i<MAX_U2_JOBS;++i)
+        if (g_u2_jobs[i].active && g_u2_jobs[i].bin==bin && g_u2_jobs[i].led!=keep_led)
+            g_u2_jobs[i].active = 0;
+}
+static inline uint8_t u2_job_find(uint8_t bin, uint8_t led){
+    for (uint8_t i=0;i<MAX_U2_JOBS;++i)
+        if (g_u2_jobs[i].active && g_u2_jobs[i].bin==bin && g_u2_jobs[i].led==led) return i;
+    return 0xFF;
+}
+static volatile uint16_t ws_last_led_bin1 = 0;
+static inline void ws_set_only_bin1(uint16_t led1){
+    if (ws_last_led_bin1 && ws_last_led_bin1 <= WS_LED_COUNT){
+        const uint16_t i = (uint16_t)(ws_last_led_bin1 - 1);
+        ws_buf[i].r = ws_buf[i].g = ws_buf[i].b = 0;
+        ws_dirty = true;
+    }
+    ws_last_led_bin1 = led1;
+    ws_set_red_1indexed(led1);
+}
+
+static inline void jobs_remove_by_con_except(uint8_t con, uint8_t keep_led){
+    for (uint8_t i=0;i<MAX_LED_JOBS;++i)
+        if (g_jobs[i].active && g_jobs[i].con==con && g_jobs[i].led!=keep_led)
+            g_jobs[i].active = 0;
+}
+static inline uint8_t job_find(uint8_t con, uint8_t led){
+    for (uint8_t i=0;i<MAX_LED_JOBS;++i)
+        if (g_jobs[i].active && g_jobs[i].con==con && g_jobs[i].led==led) return i;
+    return 0xFF;
+}
+static inline uint8_t job_alloc(uint8_t con, uint8_t led){
+    for (uint8_t i=0;i<MAX_LED_JOBS;++i)
+        if (!g_jobs[i].active){ g_jobs[i]=(LedJob){con,led,(uint16_t)g_tick,1}; return i; }
+    return 0xFF;
+}
+
+/* App handlers */
+// Legacy accessory path is now handled as official mode=0; the old helper is unused.
+
+/* Upload-map (unchanged) */
+static void handle_upload_map(const uint8_t *pay, uint8_t pal){
+    if (pal < 1) return;
+    const uint8_t N = pay[0];
+    if (pal < (uint8_t)(1 + 2U * N)) return;
+    cfg_count = 0;
+    for (uint8_t i = 0; i < N && cfg_count < MAX_CFG; ++i){
+        const uint8_t c = pay[1 + 2*i + 0];
+        const uint8_t s = pay[1 + 2*i + 1];
+        if (s == 0x01) cfg_conn[cfg_count++] = c;
+    }
+    g_status_ext = 0x00;
+}
+
+static inline void clear_btn_p23_only(void) {
+    g_status_ext &= (uint8_t)~BTN_P23_BIT;   // clear bit1, keep bit0
+}
+
+// SC=0x02 (LED ON) — mode after SC:
+//   0x00 : [00, 00, 00, 02, bin, led]                  // legacy-as-current → BIN + WS mirror for bin==1
+//   0x01 : [01, con, led]                              // UART1 only
+//   0x02 : [02, bin, bin_led, flags, con, con_led]     // BIN + UART1 in one frame (flags ignored for now)
+static void handle_led_ctrl(const uint8_t *pay, uint8_t pal){
+    if (pal < 3) return;
+    const uint8_t mode = pay[0];
+
+    if (mode == 0x00){
+        if (pal < 6) return;
+        if (pay[1] != 0x00 || pay[2] != 0x00 || pay[3] != 0x02) return;
+        const uint8_t bin = pay[4], led = pay[5];
+
+        // BIN: reset-on-new per BIN + dedup + pre-empt RR
+        NVIC_DisableIRQ(RITIMER_IRQn);
+        u2_jobs_remove_by_bin_except(bin, led);
+        u2_job_start(bin, led);
+        uint8_t idx = u2_job_find(bin, led);
+        if (idx != 0xFF){
+            g_u2_jobs[idx].next_allowed_tick = (uint16_t)g_tick;
+            u2_jobs_rr = idx;
+        }
+        NVIC_EnableIRQ(RITIMER_IRQn);
+
+        if (bin == 1) ws_set_only_bin1(led);
+        return;
+    }
+
+    if (mode == 0x01){
+        if (pal < 3) return;
+        const uint8_t con = pay[1], led = pay[2];
+
+        // UART1: reset-on-new per connector + dedup + pre-empt RR
+        NVIC_DisableIRQ(RITIMER_IRQn);
+        jobs_remove_by_con_except(con, led);
+        uint8_t idx = job_find(con, led);
+        if (idx == 0xFF) idx = job_alloc(con, led);
+        if (idx != 0xFF){
+            g_jobs[idx].next_allowed_tick = (uint16_t)g_tick;
+            jobs_rr = idx;
+        }
+        NVIC_EnableIRQ(RITIMER_IRQn);
+        return;
+    }
+
+    if (mode == 0x02){
+        if (pal < 6) return; // need bin,bin_led,flags,con,con_led
+        const uint8_t bin     = pay[1];
+        const uint8_t bin_led = pay[2];
+        /* const uint8_t flags = pay[3]; */ (void)pay; // reserved/unknown, ignored for now
+        const uint8_t con     = pay[4];
+        const uint8_t con_led = pay[5];
+
+        // --- BIN side ---
+        NVIC_DisableIRQ(RITIMER_IRQn);
+        u2_jobs_remove_by_bin_except(bin, bin_led);
+        u2_job_start(bin, bin_led);
+        uint8_t bidx = u2_job_find(bin, bin_led);
+        if (bidx != 0xFF){
+            g_u2_jobs[bidx].next_allowed_tick = (uint16_t)g_tick;
+            u2_jobs_rr = bidx;
+        }
+        NVIC_EnableIRQ(RITIMER_IRQn);
+        if (bin == 1) ws_set_only_bin1(bin_led);
+
+        // --- UART1 side ---
+        NVIC_DisableIRQ(RITIMER_IRQn);
+        jobs_remove_by_con_except(con, con_led);
+        uint8_t cidx = job_find(con, con_led);
+        if (cidx == 0xFF) cidx = job_alloc(con, con_led);
+        if (cidx != 0xFF){
+            g_jobs[cidx].next_allowed_tick = (uint16_t)g_tick;
+            jobs_rr = cidx; // ensure this LED fires next tick
+        }
+        NVIC_EnableIRQ(RITIMER_IRQn);
+        return;
+    }
+
+    // Unknown mode → ignore safely
+}
+
+static void handle_led_reset(const uint8_t *pay, uint8_t pal){
+    (void)pay; (void)pal;
+    for (uint8_t i = 0; i < MAX_LED_JOBS; ++i) g_jobs[i].active = 0;
+    g_off_broadcast_pending  = 1;
+    u2_jobs_stop_all();
+    g_off_broadcast2_pending = 1;
+    clear_btn_p23_only();
+    ws_clear_all();
+}
+static void handle_relay_set(const uint8_t *pay, uint8_t pal){
+    if (pal < 2) return;
+    Board_Relay_Set(pay[0], (pay[1] == 0x01));
+}
+static void handle_btnflag_reset(const uint8_t *pay, uint8_t pal){
+    (void)pay; (void)pal; g_status_ext = 0x00;
+}
+
+static void handle_status01_once(const uint8_t *pay, uint8_t pal){
+    // Kill all active LED jobs so OFF sticks
+    for (uint8_t i = 0; i < MAX_LED_JOBS; ++i) g_jobs[i].active = 0;
+    u2_jobs_stop_all();
+
+    // Broadcast OFF on both UARTs and clear WS
+    g_off_broadcast_pending  = 1;
+    g_off_broadcast2_pending = 1;
+    ws_clear_all();
+    // Decide scope: all connectors or one
+    if (pal == 0 || (pal >= 1 && pay[0] == 0x00)) {
+        g_status01_mask = 0xFFFFFFFFu;      // all connectors
+    } else {
+        const uint8_t con = pay[0];
+        if (con >= 1 && con <= 31) g_status01_mask = (1u << (con - 1));
+        else g_status01_mask = 0;           // invalid -> no effect
+    }
+
+
+}
+
+/* UART0 RX (App->RX) */
+typedef enum { RXF_WAIT_SOF=0, RXF_WAIT_LEN, RXF_COLLECT_BODY, RXF_WAIT_END } rx_fsm_t;
+static volatile rx_fsm_t rx_state = RXF_WAIT_SOF;
+static volatile uint8_t  rx_len   = 0;
+static uint8_t           rx_buf[RX_LEN_MAX];
+static uint8_t           rx_idx   = 0;
+
+static void dispatch_app_frame(const uint8_t *p, uint8_t len){
+    if (len < 3) return;
+    const uint8_t group = p[0], id = p[1], sc = p[2];
+    const uint8_t *pay = (len > 3) ? &p[3] : NULL;
+    const uint8_t pal  = (len > 3) ? (uint8_t)(len - 3) : 0;
+    if (group != GRP_APP_TO_RX || id != RX_ID) return;
+    switch (sc){
+        case SC_POLL: break;
+        case SC_UPLOAD_MAP:    handle_upload_map(pay, pal);    break;
+        case SC_LED_CTRL:      handle_led_ctrl(pay, pal);      break;  /* mode-based */
+        case SC_NEW_STATUS01:  handle_status01_once(pay, pal); break;
+        case SC_LED_RESET:     handle_led_reset(pay, pal);     break;  /* global OFF */
+        case SC_RELAY_SET:     handle_relay_set(pay, pal);     break;
+        case SC_BTNFLAG_RESET: handle_btnflag_reset(pay, pal); break;
+        default: break;
+    }
+    send_status();
+}
+void UART0_IRQHandler(void){
+    while (Chip_UART_ReadLineStatus(UART_APP) & UART_LSR_RDR){
+        const uint8_t b = Chip_UART_ReadByte(UART_APP);
+        g_app_last_activity_tick = (uint16_t)g_tick;
+        switch (rx_state){
+        case RXF_WAIT_SOF:      if (b == SOF) rx_state = RXF_WAIT_LEN; break;
+        case RXF_WAIT_LEN:
+            rx_len = b; rx_idx = 0;
+            if (!rx_len || rx_len > RX_LEN_MAX) { rx_state = RXF_WAIT_SOF; break; }
+            rx_state = RXF_COLLECT_BODY; break;
+        case RXF_COLLECT_BODY:
+            if (rx_idx < RX_LEN_MAX){
+                rx_buf[rx_idx++] = b;
+                if (rx_idx == rx_len) rx_state = RXF_WAIT_END;
+            } else { rx_state = RXF_WAIT_SOF; }
+            break;
+        case RXF_WAIT_END:
+            if (b == END_BYTE) dispatch_app_frame(rx_buf, rx_len);
+            rx_state = RXF_WAIT_SOF; break;
+        default: rx_state = RXF_WAIT_SOF; break;
+        }
+    }
+}
+
+/* UART1 RX (Slave->RX) */
+typedef enum { U1_WAIT_SOF=0, U1_GOT_SOF, U1_WAIT_LEN, U1_COLLECT, U1_WAIT_END } u1_fsm_t;
+static volatile u1_fsm_t u1_state = U1_WAIT_SOF;
+static volatile uint8_t  u1_len   = 0, u1_idx = 0;
+static uint8_t           u1_pay[8];
+
+void UART1_IRQHandler(void){
+    while (Chip_UART_ReadLineStatus(UART_SLAVE) & UART_LSR_RDR){
+        const uint8_t b = Chip_UART_ReadByte(UART_SLAVE);
+        switch (u1_state){
+        case U1_WAIT_SOF: if (b == SOF) u1_state = U1_GOT_SOF; break;
+        case U1_GOT_SOF:
+            if (b == SOF) { u1_state = U1_WAIT_LEN; }
+            else {
+                u1_len = b; u1_idx = 0;
+                if (!u1_len || u1_len > sizeof(u1_pay)) { u1_state = U1_WAIT_SOF; break; }
+                u1_state = U1_COLLECT;
+            }
+            break;
+        case U1_WAIT_LEN:
+            u1_len = b; u1_idx = 0;
+            if (!u1_len || u1_len > sizeof(u1_pay)) { u1_state = U1_WAIT_SOF; break; }
+            u1_state = U1_COLLECT; break;
+        case U1_COLLECT:
+            u1_pay[u1_idx++] = b;
+            if (u1_idx == u1_len) u1_state = U1_WAIT_END;
+            break;
+        case U1_WAIT_END:
+            if (b == END_BYTE && u1_len == 3 && u1_pay[0] == SC_STATUS){
+                const uint8_t addr = u1_pay[1], st = u1_pay[2];
+                if (addr >= 1 && addr <= 31 && st){
+                    const uint32_t bit = CONN_BIT(addr);
+                    round_alive_mask |= bit;
+                    if (st == 0x03) round_triggered_mask |= bit;
+                    else            round_triggered_mask &= ~bit;
+                    if (g_led_streaming_active){
+                        g_alive_mask |= bit;
+                        if (st == 0x03) g_triggered_mask |= bit;
+                        else            g_triggered_mask &= ~bit;
+                    }
+                }
+            }
+            u1_state = U1_WAIT_SOF; break;
+        default: u1_state = U1_WAIT_SOF; break;
+        }
+    }
+}
+
+/* RIT: schedules UART1 LED/poll, UART2 streaming; sets WS flush flag only */
+static volatile uint8_t poll_rr_idx     = 0;
+static volatile bool    led_active_prev = false;
+
+static inline void commit_and_clear_poll_round(void){
+    g_alive_mask     = round_alive_mask;
+    g_triggered_mask = round_triggered_mask & g_alive_mask;
+    round_alive_mask     = 0;
+    round_triggered_mask = 0;
+}
+
+void RIT_IRQHandler(void){
+    Chip_RIT_ClearInt(LPC_RITIMER);
+    g_tick++;
+
+    if (g_off_broadcast_pending){ slave_enqueue_led_off_broadcast(); g_off_broadcast_pending = 0; }
+    if (g_off_broadcast2_pending){ bin_enqueue_led_off_broadcast_uart2(); g_off_broadcast2_pending = 0; }
+
+    const bool app_idle = ((int16_t)((uint16_t)g_tick - g_app_last_activity_tick) >= (int16_t)APP_IDLE_TICKS);
+    if (app_idle){
+        slave_enqueue_led_off_broadcast();
+        bin_enqueue_led_off_broadcast_uart2();
+        if (!g_idle_ws_cleared){ ws_clear_all(); g_idle_ws_cleared = 1; }
+        ws_flush_pending = 1; /* request WS flush in main loop */
+        return;
+    }
+    g_idle_ws_cleared = 0;
+
+    bool led_active_now = false;
+    for (uint8_t i = 0; i < MAX_LED_JOBS; ++i){ if (g_jobs[i].active){ led_active_now = true; break; } }
+    g_led_streaming_active = led_active_now;
+
+    if (led_active_now){
+        led_active_prev = true;
+        for (uint8_t k = 0; k < MAX_LED_JOBS; ++k){
+            const uint8_t i = (uint8_t)((jobs_rr + k) % MAX_LED_JOBS);
+            if (!g_jobs[i].active) continue;
+            const bool time_ok = ((int16_t)((uint16_t)g_tick - g_jobs[i].next_allowed_tick) >= 0);
+            if (time_ok){
+                slave_enqueue_led_on(g_jobs[i].con, g_jobs[i].led);
+                g_jobs[i].next_allowed_tick = (uint16_t)(g_tick + LED_JOB_MIN_PERIOD_TICKS);
+                jobs_rr = (uint8_t)((i + 1) % MAX_LED_JOBS);
+                break;
+            }
+        }
+        if (ws_dirty) ws_flush_pending = 1;
+    } else {
+        if (led_active_prev){ led_active_prev = false; poll_rr_idx = 0; }
+        if (cfg_count){
+            if (poll_rr_idx == 0) commit_and_clear_poll_round();
+            const uint8_t con = cfg_conn[poll_rr_idx];
+            slave_enqueue_poll(con);
+            poll_rr_idx++;
+            if (poll_rr_idx >= cfg_count) poll_rr_idx = 0;
+        }
+        if (ws_dirty) ws_flush_pending = 1;
+    }
+
+    /* UART2 BIN streaming: one job per tick */
+    for (uint8_t k = 0; k < MAX_U2_JOBS; ++k){
+        const uint8_t i = (uint8_t)((u2_jobs_rr + k) % MAX_U2_JOBS);
+        if (!g_u2_jobs[i].active) continue;
+        const bool time_ok = ((int16_t)((uint16_t)g_tick - g_u2_jobs[i].next_allowed_tick) >= 0);
+        if (time_ok){
+            bin_enqueue_led_on_uart2(g_u2_jobs[i].bin, g_u2_jobs[i].led);
+            g_u2_jobs[i].next_allowed_tick = (uint16_t)(g_tick + U2_JOB_MIN_PERIOD_TICKS);
+            u2_jobs_rr = (uint8_t)((i + 1) % MAX_U2_JOBS);
+            break;
+        }
+    }
+}
+
+void GPIO_IRQ_HANDLER(void){
+    /* Latch both edges (your code reads rising|falling; we trigger on falling) */
+    uint32_t stat_r = Chip_GPIOINT_GetStatusRising (LPC_GPIOINT, GPIOINT_PORT2);
+    uint32_t stat_f = Chip_GPIOINT_GetStatusFalling(LPC_GPIOINT, GPIOINT_PORT2);
+    uint32_t stat   = stat_r | stat_f;
+
+    /* P2.3 => add 2 (bit1) */
+    if (stat & (1u << GPIO_BUTTON_S2_PIN)){
+        g_status_ext |= BTN_P23_BIT;  /* set bit1 */
+        Chip_GPIOINT_ClearIntStatus(LPC_GPIOINT, GPIOINT_PORT2, (1u << GPIO_BUTTON_S2_PIN));
+    }
+
+    /* P2.4 => add 1 (bit0) */
+    if (stat & (1u << GPIO_BUTTON_S1_PIN)){
+        g_status_ext |= BTN_P24_BIT;  /* set bit0 */
+        Chip_GPIOINT_ClearIntStatus(LPC_GPIOINT, GPIOINT_PORT2, (1u << GPIO_BUTTON_S1_PIN));
+    }
+}
+
+/* Main: drains queues, flushes WS outside ISR */
+int main(void){
+    SystemCoreClockUpdate();
+    Board_Init();
+
+    Chip_GPIO_SetPinDIRInput(LPC_GPIO, GPIO_BUTTON_PORT, GPIO_BUTTON_S1_PIN);      // P2.3
+    Chip_GPIO_SetPinDIRInput(LPC_GPIO, GPIO_BUTTON_PORT, GPIO_BUTTON_S2_PIN);      // P2.4
+
+    /* Clear any latched edge flags *before* enabling */
+    Chip_GPIOINT_ClearIntStatus(LPC_GPIOINT, GPIOINT_PORT2, (1u << GPIO_BUTTON_S1_PIN) | (1u << GPIO_BUTTON_S2_PIN));
+
+    /* Arm falling-edge interrupts (active-low button to GND) */
+    Chip_GPIOINT_SetIntFalling(LPC_GPIOINT, GPIOINT_PORT2, (1u << GPIO_BUTTON_S1_PIN) | (1u << GPIO_BUTTON_S2_PIN));
+
+    NVIC_ClearPendingIRQ(GPIO_NVIC_NAME);
+    NVIC_SetPriority(GPIO_NVIC_NAME, 2);
+    NVIC_EnableIRQ(GPIO_NVIC_NAME);
+
+    Chip_IOCON_Init(LPC_IOCON);
+    Chip_GPIO_Init(LPC_GPIO);
+
+    Chip_IOCON_PinMuxSet(LPC_IOCON, 3, 25, IOCON_FUNC0 | IOCON_MODE_INACT);
+    Chip_IOCON_PinMuxSet(LPC_IOCON, 3, 26, IOCON_FUNC0 | IOCON_MODE_INACT);
+    Chip_GPIO_SetPinDIROutput(LPC_GPIO, 3, 25);
+    Chip_GPIO_SetPinDIROutput(LPC_GPIO, 3, 26);
+
+    Chip_UART_Init(UART_APP);
+    Chip_UART_SetBaud(UART_APP, 19200);
+    Chip_UART_ConfigData(UART_APP, UART_LCR_WLEN8 | UART_LCR_SBS_1BIT);
+    Chip_UART_SetupFIFOS(UART_APP, UART_FCR_FIFO_EN | UART_FCR_TRG_LEV2);
+    Chip_UART_TXEnable(UART_APP);
+
+    Chip_UART_Init(UART_SLAVE);
+    Chip_UART_SetBaud(UART_SLAVE, 9600);
+    Chip_UART_ConfigData(UART_SLAVE, UART_LCR_WLEN8 | UART_LCR_SBS_1BIT);
+    Chip_UART_SetupFIFOS(UART_SLAVE, UART_FCR_FIFO_EN | UART_FCR_TRG_LEV2);
+    Chip_UART_TXEnable(UART_SLAVE);
+
+    Chip_UART_Init(UART_BIN);
+    Chip_UART_SetBaud(UART_BIN, 9600);
+    Chip_UART_ConfigData(UART_BIN, UART_LCR_WLEN8 | UART_LCR_SBS_1BIT);
+    Chip_UART_SetupFIFOS(UART_BIN, UART_FCR_FIFO_EN | UART_FCR_TRG_LEV2);
+    Chip_UART_TXEnable(UART_BIN);
+
+    Chip_UART_IntEnable(UART_APP,   UART_IER_RBRINT | UART_IER_RLSINT);
+    NVIC_SetPriority(IRQ_APP,   3); NVIC_EnableIRQ(IRQ_APP);
+    Chip_UART_IntEnable(UART_SLAVE, UART_IER_RBRINT | UART_IER_RLSINT);
+    NVIC_SetPriority(IRQ_SLAVE, 2); NVIC_EnableIRQ(IRQ_SLAVE);
+
+    Chip_RIT_Init(LPC_RITIMER);
+    Chip_RIT_SetTimerInterval(LPC_RITIMER, RIT_TICK_MS);
+    NVIC_ClearPendingIRQ(RITIMER_IRQn);
+    NVIC_SetPriority(RITIMER_IRQn, 1);
+    NVIC_EnableIRQ(RITIMER_IRQn);
+
+    for (;;){
+        if (g_tx_len){
+            const uint8_t n = g_tx_len;
+            Chip_UART_SendBlocking(UART_APP, g_tx_buf, n);
+            g_tx_len = 0;
+            g_app_last_activity_tick = (uint16_t)g_tick;
+        }
+        U1Frame fr;
+        if (u1q_pop_main(&fr)) Chip_UART_SendBlocking(UART_SLAVE, fr.data, fr.len);
+        U2Frame fr2;
+        if (u2q_pop_main(&fr2)) Chip_UART_SendBlocking(UART_BIN, fr2.data, fr2.len);
+
+        if (ws_flush_pending){ ws_flush_pending = 0; ws_flush_if_dirty(); }
+
+        __WFI();
+    }
+}

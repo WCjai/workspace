@@ -6,6 +6,7 @@ C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/g
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/gpio_17xx_40xx.h:156:20:Chip_GPIO_SetPinDIRInput	16	static
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/gpio_17xx_40xx.h:169:20:Chip_GPIO_SetPinDIR	16	static
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/gpio_17xx_40xx.h:190:20:Chip_GPIO_WriteDirBit	16	static
-../src/board.c:30:6:Board_Relays_Init	16	static
-../src/board.c:38:6:Board_Relay_Set	24	static
-../src/board.c:45:6:Board_Init	8	static
+../src/board.c:33:6:Board_Relays_Init	16	static
+../src/board.c:41:6:Board_ws2812_Init	8	static
+../src/board.c:48:6:Board_Relay_Set	24	static
+../src/board.c:55:6:Board_Init	8	static

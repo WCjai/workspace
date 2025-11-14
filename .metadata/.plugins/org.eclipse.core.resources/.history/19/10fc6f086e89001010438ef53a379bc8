@@ -1,0 +1,71 @@
+#include "chip.h"
+#include <stdint.h>
+
+#define RELAY1_YELLOW_PORT 4
+#define RELAY1_YELLOW_PIN 28
+#define RELAY2_GREEN_PORT 0
+#define RELAY2_GREEN_PIN 4
+#define RELAY3_RED_PORT 0
+#define RELAY3_RED_PIN 5
+#define RELAY4_CY_FW_PORT 0
+#define RELAY4_CY_FW_PIN 6
+#define RELAY5_CY_BW_PORT 0
+#define RELAY5_CY_BW_PIN 7
+
+#define NUM_RELAYS 5
+
+const struct {
+    uint8_t port;
+    uint8_t pin;
+}leds[NUM_RELAYS] = {
+	{RELAY1_YELLOW_PORT, RELAY1_YELLOW_PIN},   // RELAY1_YELLOW
+    {RELAY2_GREEN_PORT, RELAY2_GREEN_PIN},   // RELAY2_GREEN
+    {RELAY3_RED_PORT, RELAY3_RED_PIN},   // RELAY3_RED
+    {RELAY4_CY_FW_PORT, RELAY4_CY_FW_PIN},   // RELAY4_CY_FW
+    {RELAY5_CY_BW_PORT, RELAY5_CY_BW_PIN},   // RELAY5_CY_BW
+
+};
+
+const uint32_t OscRateIn = 12000000;   //12.00 MHz
+const uint32_t RTCOscRateIn = 32768;   //32.768 kHz
+
+#define TICKRATE_HZ (1000)
+
+volatile uint32_t tick_count = 0;
+volatile uint8_t current_led = 0;
+
+void SysTick_Handler(void) {
+    tick_count++;
+    if (tick_count >= 500) {
+
+    	for (uint8_t i = 0; i < NUM_RELAYS; i++) {
+    		Chip_GPIO_SetPinState(LPC_GPIO, leds[i].port, leds[i].pin, false);
+    		}
+
+    	Chip_GPIO_SetPinState(LPC_GPIO, leds[current_led].port, leds[current_led].pin, true);
+        current_led++;
+
+    	if (current_led >= NUM_RELAYS) current_led = 0;
+    		tick_count = 0;
+    		}
+}
+
+int main(void) {
+    SystemCoreClockUpdate();
+    Chip_GPIO_Init(LPC_GPIO);
+
+    for (uint8_t i = 0; i < NUM_RELAYS; i++) {
+            Chip_IOCON_PinMuxSet(LPC_IOCON, leds[i].port, leds[i].pin, IOCON_FUNC0 | IOCON_MODE_INACT);
+            Chip_GPIO_SetPinDIROutput(LPC_GPIO, leds[i].port, leds[i].pin);
+            Chip_GPIO_SetPinState(LPC_GPIO, leds[i].port, leds[i].pin, false);
+        }
+
+    if (SysTick_Config(SystemCoreClock / TICKRATE_HZ)) {
+        while (1) {
+        }
+    }
+
+    while (1) {
+        __WFI();
+    }
+}

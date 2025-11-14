@@ -1,0 +1,18 @@
+14:34:57 **** Incremental Build of configuration Debug for project periph_blinky ****
+make -r -j16 all 
+make[1]: Nothing to be done for 'main-build'.
+Performing post-build steps
+arm-none-eabi-size "periph_blinky.axf" && ^ ; arm-none-eabi-objcopy -v -O binary "periph_blinky.axf" "periph_blinky.bin" && ^ ; arm-none-eabi-objcopy -v -O ihex   "periph_blinky.axf" "periph_blinky.hex" && ^ ; checksum -p LPC1769 -d "periph_blinky.bin" ;
+   text	   data	    bss	    dec	    hex	filename
+   5632	      0	    492	   6124	   17ec	periph_blinky.axf
+c:/nxp/mcuxpressoide_25.6.136/ide/plugins/com.nxp.mcuxpresso.tools.win32_25.6.0.202501151204/buildtools/bin/sh: ^: not found
+copy from `periph_blinky.axf' [elf32-littlearm] to `periph_blinky.bin' [binary]
+c:/nxp/mcuxpressoide_25.6.136/ide/plugins/com.nxp.mcuxpresso.tools.win32_25.6.0.202501151204/buildtools/bin/sh: ^: not found
+copy from `periph_blinky.axf' [elf32-littlearm] to `periph_blinky.hex' [ihex]
+c:/nxp/mcuxpressoide_25.6.136/ide/plugins/com.nxp.mcuxpresso.tools.win32_25.6.0.202501151204/buildtools/bin/sh: ^: not found
+Written checksum 0xefff749e at offset 0x1c in file periph_blinky.bin
+Previous value 0x00000000 at offset 0x1c in file periph_blinky.bin
+ 
+
+14:34:57 Build Finished. 0 errors, 0 warnings. (took 364ms)
+

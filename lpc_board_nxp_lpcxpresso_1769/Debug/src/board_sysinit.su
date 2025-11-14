@@ -1,4 +1,4 @@
 C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\lpc_chip_175x_6x\inc/sysctl_17xx_40xx.h:153:20:Chip_SYSCTL_SetFLASHAccess	24	static
-../src/board_sysinit.c:19:6:Board_SetupMuxing	8	static
-../src/board_sysinit.c:24:6:Board_SetupClocking	8	static
-../src/board_sysinit.c:29:6:Board_SystemInit	8	static
+../src/board_sysinit.c:27:6:Board_SetupMuxing	8	static
+../src/board_sysinit.c:32:6:Board_SetupClocking	8	static
+../src/board_sysinit.c:42:6:Board_SystemInit	8	static
