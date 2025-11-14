@@ -3473,3 +3473,62 @@ This warning can be switched off on the Team > Git > Confirmations and Warnings 
 
 !ENTRY com.nxp.mcuxpresso.core.datamodels 1 0 2025-11-14 13:43:17.944
 !MESSAGE Recreating part support. No part support available.
+!SESSION 2025-11-14 15:52:53.045 -----------------------------------------------
+eclipse.buildId=unknown
+java.version=17.0.9
+java.vendor=Eclipse Adoptium
+BootLoader constants: OS=win32, ARCH=x86_64, WS=win32, NL=en_IN
+Command-line arguments:  -os win32 -ws win32 -arch x86_64
+
+!ENTRY org.eclipse.egit.ui 2 0 2025-11-14 15:53:31.707
+!MESSAGE Warning: The environment variable HOME is not set. The following directory will be used to store the Git
+user global configuration and to define the default location to store repositories: 'C:\Users\mad23'. If this is
+not correct please set the HOME environment variable and restart Eclipse. Otherwise Git for Windows and
+EGit might behave differently since they see different configuration options.
+This warning can be switched off on the Team > Git > Confirmations and Warnings preference page.
+
+!ENTRY com.nxp.mcuxpresso.core.datamodels 1 0 2025-11-14 15:53:32.261
+!MESSAGE Recreating part support. No part support available.
+
+!ENTRY com.crt.log 4 -1 2025-11-14 15:53:32.271
+!MESSAGE C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\.mcuxpressoide_packages_support\info.properties: The process cannot access the file because it is being used by another process
+!STACK 0
+java.lang.Exception: java.nio.file.FileSystemException: C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\.mcuxpressoide_packages_support\info.properties: The process cannot access the file because it is being used by another process
+	at com.crt.utils.general.Reporter.log(Reporter.java:592)
+	at com.nxp.mcuxpresso.core.datamodels.providers.SDKManifestProvider$8.visitFile(SDKManifestProvider.java:5593)
+	at com.nxp.mcuxpresso.core.datamodels.providers.SDKManifestProvider$8.visitFile(SDKManifestProvider.java:1)
+	at java.base/java.nio.file.Files.walkFileTree(Files.java:2811)
+	at java.base/java.nio.file.Files.walkFileTree(Files.java:2882)
+	at com.nxp.mcuxpresso.core.datamodels.providers.SDKManifestProvider.refreshAll(SDKManifestProvider.java:5586)
+	at com.nxp.mcuxpresso.core.datamodels.SDKChipVendorDatabase.refresh(SDKChipVendorDatabase.java:745)
+	at com.nxp.mcuxpresso.core.datamodels.SDKChipVendorDatabase$1.run(SDKChipVendorDatabase.java:402)
+	at org.eclipse.core.internal.jobs.Worker.run(Worker.java:63)
+Caused by: java.nio.file.FileSystemException: C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\.mcuxpressoide_packages_support\info.properties: The process cannot access the file because it is being used by another process
+	at java.base/sun.nio.fs.WindowsException.translateToIOException(WindowsException.java:92)
+	at java.base/sun.nio.fs.WindowsException.rethrowAsIOException(WindowsException.java:103)
+	at java.base/sun.nio.fs.WindowsException.rethrowAsIOException(WindowsException.java:108)
+	at java.base/sun.nio.fs.WindowsFileSystemProvider.implDelete(WindowsFileSystemProvider.java:275)
+	at java.base/sun.nio.fs.AbstractFileSystemProvider.delete(AbstractFileSystemProvider.java:105)
+	at java.base/java.nio.file.Files.delete(Files.java:1152)
+	at com.nxp.mcuxpresso.core.datamodels.providers.SDKManifestProvider$8.visitFile(SDKManifestProvider.java:5591)
+	... 7 more
+
+!ENTRY com.crt.log 4 -1 2025-11-14 15:53:32.275
+!MESSAGE C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\.mcuxpressoide_packages_support
+!STACK 0
+java.lang.Exception: java.nio.file.DirectoryNotEmptyException: C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\.mcuxpressoide_packages_support
+	at com.crt.utils.general.Reporter.log(Reporter.java:592)
+	at com.nxp.mcuxpresso.core.datamodels.providers.SDKManifestProvider$8.postVisitDirectory(SDKManifestProvider.java:5604)
+	at com.nxp.mcuxpresso.core.datamodels.providers.SDKManifestProvider$8.postVisitDirectory(SDKManifestProvider.java:1)
+	at java.base/java.nio.file.Files.walkFileTree(Files.java:2828)
+	at java.base/java.nio.file.Files.walkFileTree(Files.java:2882)
+	at com.nxp.mcuxpresso.core.datamodels.providers.SDKManifestProvider.refreshAll(SDKManifestProvider.java:5586)
+	at com.nxp.mcuxpresso.core.datamodels.SDKChipVendorDatabase.refresh(SDKChipVendorDatabase.java:745)
+	at com.nxp.mcuxpresso.core.datamodels.SDKChipVendorDatabase$1.run(SDKChipVendorDatabase.java:402)
+	at org.eclipse.core.internal.jobs.Worker.run(Worker.java:63)
+Caused by: java.nio.file.DirectoryNotEmptyException: C:\Users\mad23\Documents\MCUXpressoIDE_25.6.136\workspace\.mcuxpressoide_packages_support
+	at java.base/sun.nio.fs.WindowsFileSystemProvider.implDelete(WindowsFileSystemProvider.java:272)
+	at java.base/sun.nio.fs.AbstractFileSystemProvider.delete(AbstractFileSystemProvider.java:105)
+	at java.base/java.nio.file.Files.delete(Files.java:1152)
+	at com.nxp.mcuxpresso.core.datamodels.providers.SDKManifestProvider$8.postVisitDirectory(SDKManifestProvider.java:5602)
+	... 7 more

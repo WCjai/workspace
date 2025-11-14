@@ -81,7 +81,7 @@ static inline int pin_is_high(uint8_t pin){
     return  Chip_GPIO_GetPinState(LPC_GPIO, GPIO_BUTTON_PORT, pin);
 }
 
-#define BTN_DEBOUNCE_MS       50
+#define BTN_DEBOUNCE_MS       1000
 #define BTN_DEBOUNCE_TICKS    ((BTN_DEBOUNCE_MS + RIT_TICK_MS - 1) / RIT_TICK_MS)
 
 static volatile uint16_t g_btn1_last_tick = 0;
