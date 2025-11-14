@@ -92,7 +92,7 @@ static inline bool u1q_pop_main(U1Frame *out){
     return true;
 }
 
-typedef struct { uint8_t data[64]; uint8_t len; } U2Frame;
+typedef struct { uint8_t data[192]; uint8_t len; } U2Frame;
 #define U2_TXQ_CAP 128
 static volatile uint8_t u2_head = 0, u2_tail = 0;
 static U2Frame u2_q[U2_TXQ_CAP];
@@ -101,12 +101,13 @@ static volatile uint32_t u2_drops = 0;
 static inline bool u2q_push_isr(const uint8_t *d, uint8_t n){
     const uint8_t next = (uint8_t)((u2_head + 1) % U2_TXQ_CAP);
     if (next == u2_tail) { u2_drops++; return false; }
-    if (n > sizeof(u2_q[0].data)) n = sizeof(u2_q[0].data);
+    if (n > sizeof(u2_q[0].data)) { u2_drops++; return false; }  // <— reject instead of truncate
     memcpy(u2_q[u2_head].data, d, n);
     u2_q[u2_head].len = n;
     u2_head = next;
     return true;
 }
+
 static inline bool u2q_pop_main(U2Frame *out){
     if (u2_tail == u2_head) return false;
     *out = u2_q[u2_tail];
@@ -259,30 +260,26 @@ static inline bool is_conn_configured(uint8_t con){
 }
 
 static inline void bin_enqueue_multi_mask_uart2(uint8_t max_led, const uint8_t *list){
-    if (max_led == 0) return;
-    // Build: SOF, GRP_RX_TO_SLV, LEN, SC_SLAVE(0x85), bin(0x01), sub(0x04),
-    //        max_led, list[max_led], END
-    uint8_t len = (uint8_t)(3 /*85,bin,sub*/ + 1 /*max*/ + max_led);
-    const uint8_t total = (uint8_t)(len + 3); // SOF + GRP + LEN + ... + END fits in u2 frame
+    if (!max_led) return;
+
+    const uint8_t len = (uint8_t)(3 /*85,01,04*/ + 1 /*max*/ + max_led); // e.g., 3+1+90 = 94
+    const uint8_t total_needed = (uint8_t)(len + 3);                      // SOF,GRP,LEN + ... + END
+    if (total_needed > sizeof(((U2Frame*)0)->data)) { u2_drops++; return; }
 
     U2Frame fr;
     uint8_t *p = fr.data;
-    *p++ = SOF;
-    *p++ = GRP_RX_TO_SLV;         // 0x97
-    *p++ = len;                   // bytes until END
-    *p++ = SC_SLAVE;              // 0x85
-    *p++ = 0x01;                  // bin id = 1 (WS mirror bin)
-    *p++ = 0x04;                  // BIN subcode (same family we used before)
-    *p++ = max_led;               // number of slots in the list
-    for (uint8_t i=0; i<max_led; ++i) *p++ = list[i];  // raw list (zeros allowed → skip)
-
-    *p++ = END_BYTE;
+    *p++ = SOF;                 // 0x27
+    *p++ = GRP_RX_TO_SLV;       // 0x97
+    *p++ = len;                 // bytes up to END (fits in uint8_t)
+    *p++ = SC_SLAVE;            // 0x85
+    *p++ = 0x01;                // bin id = 1
+    *p++ = 0x04;                // BIN subcode
+    *p++ = max_led;             // number of entries
+    for (uint8_t i=0; i<max_led; ++i) *p++ = list[i];  // 0 entries are “skip”
+    *p++ = END_BYTE;            // 0x16
 
     fr.len = (uint8_t)(p - fr.data);
-    if (fr.len <= sizeof(fr.data)) {
-        // push to U2 queue
-        (void)u2q_push_isr(fr.data, fr.len);
-    }
+    (void)u2q_push_isr(fr.data, fr.len);
 }
 
 static inline void ws_set_mask_bin1_and_clear_others(uint8_t max_led, const uint8_t *list){

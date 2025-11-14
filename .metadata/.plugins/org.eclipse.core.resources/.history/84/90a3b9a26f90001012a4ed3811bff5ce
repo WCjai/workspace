@@ -1,0 +1,147 @@
+#include "chip.h"
+#include "board.h"
+
+/* UART selection */
+#define UART_SELECTION  LPC_UART0
+#define IRQ_SELECTION   UART0_IRQn
+#define HANDLER_NAME    UART0_IRQHandler
+
+/* --- Command parser state --- */
+static volatile uint8_t st   = 0;
+static volatile uint8_t rel  = 0;
+static volatile uint8_t val  = 0;
+
+
+/* --- need to change this command parser later once we able to differenciate between rely commands and heart beat --- */
+static inline void feed_parser(uint8_t b)
+{
+    switch (st) {
+    case 0: st = (b == 0x27) ? 1 : 0; break;    /* if 27 jump to next byte and soo on till 5 and 6 th bit recored  */
+    case 1: st = (b == 0x05) ? 2 : (b == 0x27 ? 1 : 0); break;
+    case 2: st = (b == 0x85) ? 3 : 0; break;
+    case 3: st = (b == 0x01) ? 4 : 0; break;
+    case 4: st = (b == 0x06) ? 5 : 0; break;
+    case 5: rel = b; st = 6; break;
+    case 6: val = b; st = 7; break;
+    case 7:
+        if (b == 0x16) {
+            /* Terminal byte OK -> apply relay */
+            Board_Relay_Set(rel, (val == 0x01));
+        }
+        st = 0;
+        break;
+    default: st = 0; break;
+    }
+}
+
+///* UART IRQ: read all pending RX bytes and feed the parser */
+//void HANDLER_NAME(void)
+//{
+//    uint32_t lsr;
+//    while (((lsr = Chip_UART_ReadLineStatus(UART_SELECTION)) & UART_LSR_RDR) != 0) {
+//        uint8_t b = Chip_UART_ReadByte(UART_SELECTION);
+//        feed_parser(b);
+//
+//        // any new parser add here
+//    }
+//    /* Clear any interrupt sources if needed (LPCOpen handler usually does this). */
+//}
+
+void UART0_IRQHandler(void)
+{
+    uint8_t byte;
+    while (Chip_UART_ReadRB(UART_ZERO, &rxring0, &byte, 1) == 1) {
+        if (rx_index0 == 0 && byte != 0x27) {
+            rx_index0 = 0;
+            continue;
+        }
+        rx_buffer0[rx_index0++] = byte;
+        if (rx_index0 == 2) {
+            rx_length0 = rx_buffer0[1] + 3;
+            if (rx_length0 > sizeof(rx_buffer0)) {
+                rx_index0 = 0;
+                rx_length0 = 0;
+            }
+        }
+
+        if (rx_length0 > 0 && rx_index0 == rx_length0) {
+            if (rx_buffer0[0] == 0x27 &&
+                rx_buffer0[rx_length0 - 1] == 0x16)
+            {
+            	switch (rx_buffer0[4])
+            	    {
+		 //Case 0 Heart Beat Command
+            	 case 0x00: {
+            	            for (int i = 0; i < sizeof(RESPONSE_SEQ0); i++) {
+            	                while (!(UART_ZERO->LSR & UART_LSR_THRE));
+            	                Chip_UART_SendByte(UART_ZERO, RESPONSE_SEQ0[i]);
+            	            }
+            	        } break;
+		 //BIN LED Off Command
+            	 case 0x3A: {
+            	            for (int i = 0; i < 96; i++) {
+            	                led_nums[i].r = 0;
+            	                led_nums[i].g = 0;
+            	                led_nums[i].b = 0;
+            	            }
+            	        } break;
+
+	         //BIN LED ON Command
+            	 case 0x02: {
+            	            bin_led_num = rx_buffer0[10];
+            	            if (bin_led_num >= 1 && bin_led_num <= 96) {
+            	                led_nums[bin_led_num - 1].r = 255;
+            	            }
+            	        } break;
+
+	         //Relay Command
+            	 case 0x06: {
+            	            relay_num = rx_buffer0[5];
+            	            relay_status_flag = rx_buffer0[6];
+            	            if (relay_num >= 1 && relay_num <= NUM_RELAYS) {
+            	                uint8_t port = leds[relay_num - 1].port;
+            	                uint8_t pin  = leds[relay_num - 1].pin;
+            	                Chip_GPIO_SetPinState(LPC_GPIO, port, pin, relay_status_flag);
+            	            }
+            	        } break;
+
+	         //Upload Config Command
+            	 case 0x04: {
+            		        upload_config_flag = 1;
+            		 	max_cons = rx_buffer0[5];
+            	 	    } break;
+
+            	        default:
+            	            break;
+            	    }
+
+            }
+            rx_index0 = 0;
+            rx_length0 = 0;
+        }
+    }
+
+    Chip_UART_IRQRBHandler(UART_ZERO, &rxring0, &txring0);
+}
+int main(void)
+{
+    SystemCoreClockUpdate();
+    Board_Init();
+
+    /* UART0: 19,200 8N1 */
+    Chip_UART_Init(UART_SELECTION);
+    Chip_UART_SetBaud(UART_SELECTION, 19200);
+    Chip_UART_ConfigData(UART_SELECTION, UART_LCR_WLEN8 | UART_LCR_SBS_1BIT);
+    Chip_UART_SetupFIFOS(UART_SELECTION, UART_FCR_FIFO_EN | UART_FCR_TRG_LEV2);
+    Chip_UART_TXEnable(UART_SELECTION);
+
+    /* Enable RX interrupt only (we don't transmit anything) */
+    Chip_UART_IntEnable(UART_SELECTION, UART_IER_RBRINT | UART_IER_RLSINT);
+    NVIC_SetPriority(IRQ_SELECTION, 1);
+    NVIC_EnableIRQ(IRQ_SELECTION);
+
+    /* Idle forever; all work happens in the UART ISR */
+    while (1) {
+        __WFI(); /* sleep until next interrupt */
+    }
+}

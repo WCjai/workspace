@@ -1,0 +1,460 @@
+#include "chip.h"
+#include "board.h"
+#include <stdbool.h>
+#include <string.h>
+
+/* =============================================================================
+   RX <-> APP Protocol (UART0)
+   Frame: [0x27][LEN][GROUP][RX_ID][SUBCMD][PAYLOAD...][0x16]
+          LEN counts bytes from GROUP..payload (excludes SOF/LEN/END)
+   GROUP: 0x85 = App->RX, 0x00 = RX->App
+   SUBCMD (App->RX): 0x00 poll, 0x02 led_ctrl, 0x04 upload_map, 0x3A led_reset, 0x06 relay_set
+   SUBCMD (RX->App):  0x0A status
+   ============================================================================= */
+
+#define UART_APP        LPC_UART0
+#define IRQ_APP         UART0_IRQn
+#define HANDLER_APP     UART0_IRQHandler
+
+#define UART_SLAVE      LPC_UART1
+#define IRQ_SLAVE       UART1_IRQn
+
+#define RX_ID           0x01
+
+/* UART0 bytes */
+enum { SOF = 0x27, END_BYTE = 0x16 };
+enum { GRP_APP_TO_RX = 0x85, GRP_RX_TO_APP = 0x00 };
+enum { SC_POLL = 0x00, SC_LED_CTRL = 0x02, SC_UPLOAD_MAP = 0x04, SC_LED_RESET = 0x3A, SC_RELAY_SET = 0x06 };
+enum { SC_STATUS = 0x0A };
+
+/* UART1 (slave) formats:
+   A) We SEND (commands/heartbeat): [27][97][LEN][85] ... [16]  (MARK=0x97, GROUP=0x85)
+   B) We RECV (simple reply):       [27][27][03][0A][con][state][16]
+        state: 0x01 normal/alive, 0x03 limit triggered
+*/
+#define U1_MARK   0x97
+#define U1_GROUP  0x85
+
+/* Status codes for UART0 payload */
+#define ST_OFF    0x00
+#define ST_ALIVE  0x05
+#define ST_LIMIT  0x07
+
+/* Config capacity */
+#define MAX_CFG         31
+
+/* UART0 RX & TX sizing */
+#define RX_LEN_MAX      (4 + 2*MAX_CFG)   /* upload_map worst-case len */
+#define TX_FRAME_MAX    (MAX_CFG + 10)    /* status frame upper bound */
+
+/* ============================ State & helpers ============================== */
+
+/* Mapped connectors (from Upload-Map) */
+static uint8_t cfg_conn[MAX_CFG];
+static uint8_t cfg_count = 0;
+
+/* Live state (per connector ID 0..255) */
+static volatile uint8_t  con_last_code[256];     /* last simple code: 0x01 alive, 0x00 off */
+static volatile uint8_t  con_limit_latched[256]; /* sticky limit flag (clear on Upload-Map) */
+
+/* Heartbeat cadence & alive timeout (anti-flap) */
+#define U1_HB_MS            500                     /* UART1 heartbeat every 500 ms */
+#define ALIVE_TIMEOUT_MS    (3 * U1_HB_MS)          /* seen within 1.5s => alive */
+
+static volatile uint32_t ms_ticks = 0;              /* 1 ms SysTick timebase */
+static volatile bool     u1_hb_due = false;         /* scheduler flag */
+static volatile uint32_t con_last_seen_ms[256];     /* last time we saw a reply for that con */
+
+/* ====================== UART1 TX queue (serialize frames) ================== */
+
+#define U1_MAX_FRAME   16
+#define U1_Q_CAP        8
+
+typedef struct { uint8_t len; uint8_t data[U1_MAX_FRAME]; } u1_frame_t;
+static volatile uint8_t u1_q_head = 0, u1_q_tail = 0;
+static u1_frame_t u1_q[U1_Q_CAP];
+
+static bool uart1_enqueue(const uint8_t *d, uint8_t n) {
+    if (!n || n > U1_MAX_FRAME) return false;
+    uint8_t next = (uint8_t)((u1_q_head + 1) % U1_Q_CAP);
+    if (next == u1_q_tail) return false; // full
+    __disable_irq();
+    u1_q[u1_q_head].len = n;
+    memcpy(u1_q[u1_q_head].data, d, n);
+    u1_q_head = next;
+    __enable_irq();
+    return true;
+}
+
+static bool uart1_dequeue(u1_frame_t *out) {
+    if (u1_q_tail == u1_q_head) return false;
+    __disable_irq();
+    *out = u1_q[u1_q_tail];
+    u1_q_tail = (uint8_t)((u1_q_tail + 1) % U1_Q_CAP);
+    __enable_irq();
+    return true;
+}
+
+static void uart1_flush(void) {
+    u1_frame_t f;
+    while (uart1_dequeue(&f)) {
+        Chip_UART_SendBlocking(UART_SLAVE, f.data, f.len);
+    }
+}
+
+/* ==================== UART1 helpers: LED, broadcast OFF, HB ================= */
+
+static inline void u1_send_led_on(uint8_t con, uint8_t led) {
+    /* 27 97 05 85 con 02 01 led 16 */
+    const uint8_t f[9] = { 0x27, U1_MARK, 0x05, U1_GROUP, con, 0x02, 0x01, led, 0x16 };
+    uart1_enqueue(f, sizeof f);
+}
+
+static inline void u1_send_led_off_broadcast(void) {
+    /* 27 97 04 85 FF 00 00 16 */
+    const uint8_t f[8] = { 0x27, U1_MARK, 0x04, U1_GROUP, 0xFF, 0x00, 0x00, 0x16 };
+    uart1_enqueue(f, sizeof f);
+}
+
+static inline void u1_send_heartbeat(uint8_t con) {
+    /* 27 97 05 85 con 00 00 00 16 */
+    const uint8_t f[9] = { 0x27, U1_MARK, 0x05, U1_GROUP, con, 0x00, 0x00, 0x00, 0x16 };
+    uart1_enqueue(f, sizeof f);
+}
+
+/* LED wrappers */
+static inline void led_on(uint8_t con, uint8_t led)  { u1_send_led_on(con, led); }
+static inline void led_off(uint8_t con, uint8_t led) { (void)con; (void)led; u1_send_led_off_broadcast(); }
+
+/* ========================= UART1 RX parser (two formats) ===================
+   A) [27][97][LEN][85]... [16]
+   B) [27][27][03][0A][con][state][16]   state: 0x01 normal/alive, 0x03 limit
+   ========================================================================== */
+
+static uint8_t rx1_buf[128];
+static uint8_t rx1_idx = 0;
+static uint8_t rx1_len = 0;
+typedef enum { RX1_SOF, RX1_MARK, RX1_LEN, RX1_BODY, RX1_END } rx1_state_t;
+static rx1_state_t rx1_state = RX1_SOF;
+typedef enum { U1FMT_NONE=0, U1FMT_MARK97, U1FMT_MARK27 } u1_fmt_t;
+static u1_fmt_t rx1_fmt = U1FMT_NONE;
+
+/* Update per-connector state from simple reply */
+static inline void u1_apply_simple_status(uint8_t con, uint8_t state) {
+    uint32_t now = ms_ticks; /* 1ms tick */
+
+    if (state == 0x03) {
+        /* LIMIT: sticky until Upload-Map */
+        con_limit_latched[con] = 1;
+        con_last_seen_ms[con]  = now;     /* still counts as recent */
+        con_last_code[con]     = 0x01;    /* keep baseline "alive" */
+    } else if (state == 0x01) {
+        /* NORMAL / ALIVE */
+        con_last_seen_ms[con]  = now;
+        con_last_code[con]     = 0x01;
+    } else {
+        /* Other states -> treat as OFF report; do not refresh last_seen */
+        con_last_code[con]     = 0x00;
+    }
+}
+
+/* (A) 27 97 LEN 85 ... 16 : reserved for future use */
+static void uart1_handle_frame97(const uint8_t *f, uint8_t n) { (void)f; (void)n; }
+
+/* (B) 27 27 03 0A <con> <state> 16 : drives alive/limit */
+static void uart1_handle_frame27(const uint8_t *body, uint8_t len) {
+    if (len != 3) return;
+    uint8_t sub   = body[0];  /* 0x0A */
+    uint8_t con   = body[1];  /* address */
+    uint8_t state = body[2];  /* 0x01 normal, 0x03 limit */
+    if (sub == 0x0A) u1_apply_simple_status(con, state);
+}
+
+void UART1_IRQHandler(void) {
+    while (Chip_UART_ReadLineStatus(UART_SLAVE) & UART_LSR_RDR) {
+        uint8_t b = Chip_UART_ReadByte(UART_SLAVE);
+
+        switch (rx1_state) {
+        case RX1_SOF:
+            if (b == SOF) { rx1_state = RX1_MARK; rx1_fmt = U1FMT_NONE; }
+            break;
+
+        case RX1_MARK:
+            if (b == U1_MARK)        { rx1_fmt = U1FMT_MARK97; rx1_state = RX1_LEN; }
+            else if (b == SOF)       { rx1_fmt = U1FMT_MARK27; rx1_state = RX1_LEN; } /* second 0x27 */
+            else                     { rx1_state = RX1_SOF; }
+            break;
+
+        case RX1_LEN:
+            rx1_len  = b;
+            rx1_idx  = 0;
+            rx1_state = (rx1_len && rx1_len <= sizeof(rx1_buf)) ? RX1_BODY : RX1_SOF;
+            break;
+
+        case RX1_BODY:
+            rx1_buf[rx1_idx++] = b;
+            if (rx1_idx == rx1_len) rx1_state = RX1_END;
+            break;
+
+        case RX1_END:
+            if (b == END_BYTE) {
+                if (rx1_fmt == U1FMT_MARK97) {
+                    uint8_t full[3 + sizeof(rx1_buf) + 1];
+                    full[0] = SOF; full[1] = U1_MARK; full[2] = rx1_len;
+                    memcpy(&full[3], rx1_buf, rx1_len);
+                    full[3 + rx1_len] = END_BYTE;
+                    uart1_handle_frame97(full, (uint8_t)(3 + rx1_len + 1));
+                } else if (rx1_fmt == U1FMT_MARK27) {
+                    /* body is [0x0A, con, state] */
+                    uart1_handle_frame27(rx1_buf, rx1_len);
+                }
+            }
+            rx1_state = RX1_SOF;
+            break;
+        }
+    }
+}
+
+/* =================== UART0 TX queue (status back to App) =================== */
+
+static volatile uint8_t g_tx_len = 0;
+static uint8_t          g_tx_buf[TX_FRAME_MAX];
+
+static inline void txq_send_now(const uint8_t *data, uint8_t n) {
+    if (n > sizeof(g_tx_buf)) n = sizeof(g_tx_buf);
+    memcpy(g_tx_buf, data, n);
+    __DSB(); __ISB();
+    g_tx_len = n;
+}
+
+/* Build UART0 status: per mapped con -> 0x07 (limit) / 0x05 (alive) / 0x00 (off) with timeout */
+static uint8_t build_status_frame(uint8_t *dst, uint8_t cap) {
+    const uint8_t N = cfg_count;
+    const uint8_t LEN   = (uint8_t)(N + 7);
+    const uint8_t TOTAL = (uint8_t)(LEN + 3);
+    if (TOTAL > cap) return 0;
+
+    uint8_t *p = dst;
+    *p++ = SOF;
+    *p++ = LEN;
+    *p++ = GRP_RX_TO_APP;
+    *p++ = RX_ID;
+    *p++ = SC_STATUS;
+    *p++ = 0x00;      /* flags */
+    *p++ = N;         /* connector count */
+
+    uint32_t now = ms_ticks;
+    for (uint8_t i = 0; i < N; ++i) {
+        const uint8_t con = cfg_conn[i];
+        uint8_t st;
+        if (con_limit_latched[con]) {
+            st = ST_LIMIT;
+        } else if (con_last_seen_ms[con] != 0 &&
+                   (uint32_t)(now - con_last_seen_ms[con]) <= ALIVE_TIMEOUT_MS) {
+            st = ST_ALIVE;
+        } else {
+            st = ST_OFF;
+        }
+        *p++ = st;
+    }
+
+    *p++ = 0x00;      /* reserved */
+    *p++ = 0x00;      /* reserved */
+    *p++ = END_BYTE;
+    return TOTAL;
+}
+
+static inline void send_status(void) {
+    uint8_t n = build_status_frame(g_tx_buf, sizeof(g_tx_buf));
+    if (n) g_tx_len = n;
+}
+
+/* ============================== Command handlers =========================== */
+
+static bool conn_is_enabled(uint8_t c){
+    for (uint8_t i=0;i<cfg_count;i++) if (cfg_conn[i]==c) return true;
+    return false;
+}
+
+static void handle_upload_map(const uint8_t *pay, uint8_t paylen) {
+    if (paylen < 1) return;
+    const uint8_t N = pay[0];
+    if (paylen < (uint8_t)(1 + 2U * N)) return;    /* need N pairs */
+
+    /* Rebuild mapping */
+    cfg_count = 0;
+    for (uint8_t i = 0; i < N && cfg_count < MAX_CFG; ++i) {
+        const uint8_t conn  = pay[1 + 2*i + 0];
+        const uint8_t state = pay[1 + 2*i + 1];
+        if (state == 0x01) cfg_conn[cfg_count++] = conn;
+    }
+
+    /* Reset mapped connectors: clear latch, clear last code, clear last seen
+       (They will become ALIVE only after real UART1 replies arrive) */
+    for (uint8_t i = 0; i < cfg_count; ++i) {
+        uint8_t c = cfg_conn[i];
+        con_limit_latched[c] = 0;
+        con_last_code[c]     = 0x00;
+        con_last_seen_ms[c]  = 0;
+    }
+
+    send_status();  /* immediate status (likely 0x00 until replies) */
+}
+
+static void handle_led_ctrl(const uint8_t *pay, uint8_t paylen) {
+    if (paylen < 3) return;
+    const uint8_t state = pay[0];  /* 1=on, 0=off */
+    const uint8_t conn  = pay[1];
+    const uint8_t led   = pay[2];
+    if (state) {
+        if (conn_is_enabled(conn)) led_on(conn, led);
+    } else {
+        /* broadcast clear; switch to per-LED off if your slave supports it */
+        led_off(conn, led);
+    }
+}
+
+static void handle_led_reset(const uint8_t *pay, uint8_t paylen) {
+    (void)pay; (void)paylen;
+    u1_send_led_off_broadcast();
+}
+
+/* Provided by board; weak stub below if not linked */
+void Board_Relay_Set(uint8_t relay, bool on);
+
+static void handle_relay_set(const uint8_t *pay, uint8_t paylen) {
+    if (paylen < 2) return;
+    const uint8_t relay = pay[0];
+    const bool    on    = (pay[1] == 0x01);
+    Board_Relay_Set(relay, on);
+}
+
+/* =============================== UART0 parser ============================== */
+
+typedef enum { RXF_WAIT_SOF=0, RXF_WAIT_LEN, RXF_COLLECT_BODY, RXF_WAIT_END } rx_fsm_t;
+
+static volatile rx_fsm_t rx_state = RXF_WAIT_SOF;
+static volatile uint8_t  rx_len   = 0;
+static uint8_t           rx_buf[RX_LEN_MAX];
+static uint8_t           rx_idx   = 0;
+
+static void dispatch_body(const uint8_t *p, uint8_t len) {
+    if (len < 3) return; /* need GROUP,ID,SUBCMD */
+
+    const uint8_t group = p[0];
+    const uint8_t id    = p[1];
+    const uint8_t sc    = p[2];
+    const uint8_t *pay  = (len > 3) ? &p[3] : NULL;
+    const uint8_t  pal  = (len > 3) ? (uint8_t)(len - 3) : 0;
+
+    if (group != GRP_APP_TO_RX || id != RX_ID) return;
+
+    switch (sc) {
+        case SC_POLL:        send_status();                 break;
+        case SC_UPLOAD_MAP:  handle_upload_map(pay, pal);   break;
+        case SC_LED_CTRL:    handle_led_ctrl(pay, pal);     break;
+        case SC_LED_RESET:   handle_led_reset(pay, pal);    break;
+        case SC_RELAY_SET:   handle_relay_set(pay, pal);    break;
+        default:                                              break;
+    }
+}
+
+static inline void rx_ingest(uint8_t b) {
+    switch (rx_state) {
+    case RXF_WAIT_SOF:
+        if (b == SOF) rx_state = RXF_WAIT_LEN;
+        break;
+    case RXF_WAIT_LEN:
+        rx_len = b;
+        if (rx_len == 0 || rx_len > RX_LEN_MAX) { rx_state = RXF_WAIT_SOF; break; }
+        rx_idx = 0;
+        rx_state = RXF_COLLECT_BODY;
+        break;
+    case RXF_COLLECT_BODY:
+        if (rx_idx < RX_LEN_MAX) {
+            rx_buf[rx_idx++] = b;
+            if (rx_idx == rx_len) rx_state = RXF_WAIT_END;
+        } else {
+            rx_state = RXF_WAIT_SOF;
+        }
+        break;
+    case RXF_WAIT_END:
+        if (b == END_BYTE) dispatch_body(rx_buf, rx_len);
+        rx_state = RXF_WAIT_SOF;
+        break;
+    default:
+        rx_state = RXF_WAIT_SOF;
+        break;
+    }
+}
+
+/* UART0 ISR */
+void HANDLER_APP(void) {
+    while (Chip_UART_ReadLineStatus(UART_APP) & UART_LSR_RDR) {
+        rx_ingest(Chip_UART_ReadByte(UART_APP));
+    }
+}
+
+/* ================================ Timing ================================== */
+
+void SysTick_Handler(void) {
+    ms_ticks++;
+    if ((ms_ticks % U1_HB_MS) == 0) u1_hb_due = true;
+}
+
+/* ================================== Main ================================== */
+
+int main(void) {
+    SystemCoreClockUpdate();
+    Board_Init();
+
+    /* UART0 (APP link): 19,200 8N1 */
+    Chip_UART_Init(UART_APP);
+    Chip_UART_SetBaud(UART_APP, 19200);
+    Chip_UART_ConfigData(UART_APP, UART_LCR_WLEN8 | UART_LCR_SBS_1BIT);
+    Chip_UART_SetupFIFOS(UART_APP, UART_FCR_FIFO_EN | UART_FCR_TRG_LEV2);
+    Chip_UART_TXEnable(UART_APP);
+    Chip_UART_IntEnable(UART_APP, UART_IER_RBRINT | UART_IER_RLSINT);
+    NVIC_SetPriority(IRQ_APP, 1);
+    NVIC_EnableIRQ(IRQ_APP);
+
+    /* UART1 (SLAVE link): 9600 8N1 */
+    Chip_UART_Init(UART_SLAVE);
+    Chip_UART_SetBaud(UART_SLAVE, 9600);
+    Chip_UART_ConfigData(UART_SLAVE, UART_LCR_WLEN8 | UART_LCR_SBS_1BIT);
+    Chip_UART_SetupFIFOS(UART_SLAVE, UART_FCR_FIFO_EN | UART_FCR_TRG_LEV2);
+    Chip_UART_TXEnable(UART_SLAVE);
+    Chip_UART_IntEnable(UART_SLAVE, UART_IER_RBRINT | UART_IER_RLSINT);
+    NVIC_SetPriority(IRQ_SLAVE, 1);
+    NVIC_EnableIRQ(IRQ_SLAVE);
+
+    /* 1 ms SysTick */
+    SysTick_Config(SystemCoreClock / 1000);
+
+    for (;;) {
+        /* Periodic UART1 heartbeats for mapped connectors */
+        if (u1_hb_due) {
+            u1_hb_due = false;
+            for (uint8_t i = 0; i < cfg_count; ++i) {
+                u1_send_heartbeat(cfg_conn[i]);   /* 27 97 05 85 <con> 00 00 00 16 */
+            }
+        }
+
+        /* Send any pending status to APP (UART0) */
+        if (g_tx_len) {
+            uint8_t n = g_tx_len;
+            Chip_UART_SendBlocking(UART_APP, g_tx_buf, n);
+            g_tx_len = 0;
+        }
+
+        /* Flush UART1 queue (LED + heartbeat), serialized => no collisions */
+        uart1_flush();
+
+        __WFI();
+    }
+}
+
+/* Weak relay shim (remove if your board layer already defines it) */
+__attribute__((weak)) void Board_Relay_Set(uint8_t relay, bool on) {
+    (void)relay; (void)on;
+}
